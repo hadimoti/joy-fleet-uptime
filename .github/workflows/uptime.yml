@@ -1,0 +1,187 @@
+# Synthetic uptime monitoring for a small set of public websites.
+#
+# It probes each site from a GitHub-hosted runner every 5 minutes and sends a
+# Telegram message when something is wrong.
+#
+# The one interesting idea here
+# -----------------------------
+# Most of these hostnames sit behind a CDN. One of them (the "origin" host)
+# deliberately bypasses it and resolves straight to the web server. Watching
+# both paths separately turns a single ambiguous "the sites are down" into two
+# distinguishable conditions that need opposite responses:
+#
+#   CDN hosts failing + origin failing  -> the server itself is down
+#   CDN hosts failing + origin healthy  -> a CDN/DNS/network-path problem;
+#                                          the server is fine, leave it alone
+#
+# Without that second data point the two are indistinguishable, and you end up
+# debugging a server that was never broken.
+#
+# Why this repository is public
+# -----------------------------
+# GitHub Actions is free and unmetered on public repositories, but metered on
+# private ones. This workflow is intentionally isolated in a public repo so it
+# can run continuously at no cost. It contains no private information: every
+# hostname it probes is already resolvable in public DNS.
+#
+# Repository secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) remain encrypted and
+# are never exposed publicly. GitHub does not expose secrets to workflows
+# triggered by pull requests from forks, so a fork cannot exfiltrate them.
+#
+# Setup
+# -----
+#   Settings -> Secrets and variables -> Actions:
+#     TELEGRAM_BOT_TOKEN   token from @BotFather
+#     TELEGRAM_CHAT_ID     chat id that should receive alerts
+# Without them the probe still runs and still fails visibly; it just cannot
+# send a message.
+
+name: uptime
+
+on:
+  schedule:
+    # Every 5 minutes. Free and unmetered because this repository is public.
+    # GitHub's scheduled triggers are best-effort and can be delayed under
+    # platform load, so treat this as very good monitoring, not a hard SLA.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # If several delayed runs queue up, only the newest matters. Without this a
+  # backlog could fire a burst of duplicate alerts for one incident.
+  group: uptime
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Probe
+        id: probe
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          CDN_HOSTS=(
+            joyteam.ir
+            www.joyteam.ir
+            admin.joyteam.ir
+            user.joyteam.ir
+            music.joyteam.ir
+            file.joyteam.ir
+            joy.joyteam.ir
+            joyst.ir
+            shahantc.ir
+            nutrized.ir
+          )
+          ORIGIN_HOST=direct.joyteam.ir
+          READY_URL=https://joyteam.ir/ready
+
+          # Two attempts before calling a host down. A single transient DNS or
+          # TLS blip on a shared runner must never wake anyone up.
+          probe() {
+            local url=$1 code
+            for _ in 1 2; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' \
+                       --max-time 15 --connect-timeout 10 \
+                       -A 'uptime-probe/1.0' "$url" 2>/dev/null)
+              case "$code" in
+                2*|3*) echo "$code"; return 0 ;;
+              esac
+              sleep 3
+            done
+            echo "${code:-000}"
+            return 1
+          }
+
+          down=()
+          for h in "${CDN_HOSTS[@]}"; do
+            code=$(probe "https://${h}/") || down+=("${h}(${code})")
+            printf '%-24s %s\n' "$h" "$code"
+          done
+
+          origin_code=$(probe "https://${ORIGIN_HOST}/") || true
+          printf '%-24s %s\n' "$ORIGIN_HOST" "$origin_code"
+
+          # The readiness endpoint reports whether the app's own dependencies
+          # are healthy, which a plain homepage check cannot see.
+          ready_code=$(probe "$READY_URL") || true
+          ready_body=$(curl -s --max-time 15 "$READY_URL" 2>/dev/null | head -c 200)
+          printf '%-24s %s %s\n' 'ready' "$ready_code" "$ready_body"
+
+          origin_ok=0
+          case "$origin_code" in 2*|3*) origin_ok=1 ;; esac
+
+          n_down=${#down[@]}
+          n_total=${#CDN_HOSTS[@]}
+
+          if [ "$n_down" -eq 0 ] && [ "$origin_ok" -eq 1 ]; then
+            verdict="OK"
+          elif [ "$origin_ok" -eq 1 ] && [ "$n_down" -gt $((n_total / 2)) ]; then
+            verdict="CDN_EDGE"
+          elif [ "$origin_ok" -eq 0 ] && [ "$n_down" -gt $((n_total / 2)) ]; then
+            verdict="ORIGIN_DOWN"
+          elif [ "$n_down" -gt 0 ]; then
+            verdict="PARTIAL"
+          else
+            verdict="ORIGIN_ONLY_DOWN"
+          fi
+
+          {
+            echo "verdict=$verdict"
+            echo "ready_code=$ready_code"
+            echo "origin_code=$origin_code"
+            echo "down_list=${down[*]:-none}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "VERDICT: $verdict"
+          [ "$verdict" = "OK" ]
+
+      - name: Alert
+        if: failure() && steps.probe.outputs.verdict != ''
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VERDICT: ${{ steps.probe.outputs.verdict }}
+          DOWN_LIST: ${{ steps.probe.outputs.down_list }}
+          READY_CODE: ${{ steps.probe.outputs.ready_code }}
+          ORIGIN_CODE: ${{ steps.probe.outputs.origin_code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "::warning::Telegram secrets not set; alert not delivered"
+            exit 0
+          fi
+
+          case "$VERDICT" in
+            CDN_EDGE)
+              headline="CDN edge failing - ORIGIN IS HEALTHY"
+              advice="The origin answers directly. This is a CDN/DNS/network-path problem. Do not restart anything on the server." ;;
+            ORIGIN_DOWN)
+              headline="ORIGIN DOWN - real outage"
+              advice="Both the CDN path and the direct origin path are failing. Investigate the server." ;;
+            PARTIAL)
+              headline="Partial outage"
+              advice="Some hosts are failing while others serve normally. Check the listed hosts." ;;
+            ORIGIN_ONLY_DOWN)
+              headline="Origin host failing (CDN hosts OK)"
+              advice="The direct origin path is down while proxied hosts serve." ;;
+            *)
+              headline="Probe failed ($VERDICT)"
+              advice="See the workflow run." ;;
+          esac
+
+          text=$(printf '%s\n\ndown: %s\nready: %s\norigin: %s\n\n%s\n\n%s' \
+            "$headline" "$DOWN_LIST" "$READY_CODE" "$ORIGIN_CODE" "$advice" "$RUN_URL")
+
+          curl -s -o /dev/null --max-time 20 \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${text}" \
+            --data-urlencode "disable_web_page_preview=true" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"

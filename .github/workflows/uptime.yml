@@ -1,7 +1,7 @@
 # Synthetic uptime monitoring for a small set of public websites.
 #
 # It probes each site from a GitHub-hosted runner every 5 minutes and sends a
-# Telegram message when something is wrong.
+# Telegram message when something is actually wrong.
 #
 # The one interesting idea here
 # -----------------------------
@@ -17,24 +17,29 @@
 # Without that second data point the two are indistinguishable, and you end up
 # debugging a server that was never broken.
 #
+# The thing that bites every synthetic monitor
+# --------------------------------------------
+# CDN bot protection challenges datacenter IPs, and a CI runner is a datacenter
+# IP. When that happens the CDN returns a 403 carrying an interstitial page
+# ("Just a moment...") while the site is completely healthy for real users --
+# the monitor is simply not allowed to look.
+#
+# Treating that as an outage would page a human every five minutes forever for
+# a non-problem, and the resulting alert fatigue would bury the one real outage
+# that matters. So a challenge is classified as INCONCLUSIVE, never as down,
+# and it never fails the job. To make those hosts genuinely measurable, add a
+# CDN rule that skips bot protection for the monitored paths (/ready, /live).
+#
 # Why this repository is public
 # -----------------------------
-# GitHub Actions is free and unmetered on public repositories, but metered on
+# GitHub Actions is free and unmetered on public repositories but metered on
 # private ones. This workflow is intentionally isolated in a public repo so it
 # can run continuously at no cost. It contains no private information: every
 # hostname it probes is already resolvable in public DNS.
 #
 # Repository secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) remain encrypted and
-# are never exposed publicly. GitHub does not expose secrets to workflows
-# triggered by pull requests from forks, so a fork cannot exfiltrate them.
-#
-# Setup
-# -----
-#   Settings -> Secrets and variables -> Actions:
-#     TELEGRAM_BOT_TOKEN   token from @BotFather
-#     TELEGRAM_CHAT_ID     chat id that should receive alerts
-# Without them the probe still runs and still fails visibly; it just cannot
-# send a message.
+# are never exposed publicly. GitHub withholds secrets from workflows triggered
+# by pull requests from forks, so a fork cannot exfiltrate them.
 
 name: uptime
 
@@ -81,16 +86,36 @@ jobs:
           ORIGIN_HOST=direct.joyteam.ir
           READY_URL=https://joyteam.ir/ready
 
-          # Two attempts before calling a host down. A single transient DNS or
-          # TLS blip on a shared runner must never wake anyone up.
+          UA='uptime-probe/1.0'
+
+          # Echoes one of:
+          #   <2xx/3xx code>  healthy        (exit 0)
+          #   CHALLENGED      CDN interstitial, inconclusive   (exit 0)
+          #   <code>|000      genuine failure                  (exit 1)
+          #
+          # Two attempts before calling anything down, so a single transient
+          # DNS or TLS blip on a shared runner never wakes anyone up.
           probe() {
             local url=$1 code
             for _ in 1 2; do
               code=$(curl -s -o /dev/null -w '%{http_code}' \
                        --max-time 15 --connect-timeout 10 \
-                       -A 'uptime-probe/1.0' "$url" 2>/dev/null)
+                       -A "$UA" "$url" 2>/dev/null)
               case "$code" in
-                2*|3*) echo "$code"; return 0 ;;
+                2*|3*)
+                  echo "$code"
+                  return 0
+                  ;;
+                403|503)
+                  # Separate a CDN challenge from a genuine 403/503 by looking
+                  # for the interstitial's own markers in the body.
+                  if curl -s --max-time 15 -A "$UA" "$url" 2>/dev/null \
+                       | head -c 2000 \
+                       | grep -qiE 'just a moment|cf-browser-verification|cf_chl|challenge-platform|__cf_chl|cdn-cgi/challenge'; then
+                    echo "CHALLENGED"
+                    return 0
+                  fi
+                  ;;
               esac
               sleep 3
             done
@@ -99,8 +124,10 @@ jobs:
           }
 
           down=()
+          challenged=()
           for h in "${CDN_HOSTS[@]}"; do
             code=$(probe "https://${h}/") || down+=("${h}(${code})")
+            if [ "$code" = "CHALLENGED" ]; then challenged+=("$h"); fi
             printf '%-24s %s\n' "$h" "$code"
           done
 
@@ -108,27 +135,50 @@ jobs:
           printf '%-24s %s\n' "$ORIGIN_HOST" "$origin_code"
 
           # The readiness endpoint reports whether the app's own dependencies
-          # are healthy, which a plain homepage check cannot see.
+          # are healthy, which a plain homepage check cannot see: an app can
+          # serve a perfectly good homepage while its database is unreachable.
           ready_code=$(probe "$READY_URL") || true
-          ready_body=$(curl -s --max-time 15 "$READY_URL" 2>/dev/null | head -c 200)
-          printf '%-24s %s %s\n' 'ready' "$ready_code" "$ready_body"
+          printf '%-24s %s\n' 'ready' "$ready_code"
 
           origin_ok=0
           case "$origin_code" in 2*|3*) origin_ok=1 ;; esac
+          ready_ok=0
+          case "$ready_code" in 2*|3*) ready_ok=1 ;; esac
 
           n_down=${#down[@]}
+          n_chal=${#challenged[@]}
           n_total=${#CDN_HOSTS[@]}
+          # A challenged host is inconclusive: the monitor was denied a look,
+          # which says nothing about whether real users can load the site. Only
+          # hosts that actually answered count toward the verdict.
+          n_answered=$((n_total - n_chal))
 
-          if [ "$n_down" -eq 0 ] && [ "$origin_ok" -eq 1 ]; then
-            verdict="OK"
-          elif [ "$origin_ok" -eq 1 ] && [ "$n_down" -gt $((n_total / 2)) ]; then
-            verdict="CDN_EDGE"
-          elif [ "$origin_ok" -eq 0 ] && [ "$n_down" -gt $((n_total / 2)) ]; then
+          if [ "$n_chal" -gt 0 ]; then
+            echo ""
+            echo "NOTE: ${n_chal}/${n_total} host(s) served a CDN bot challenge:"
+            echo "      ${challenged[*]}"
+            echo "      Inconclusive, NOT counted as failures. To make these"
+            echo "      measurable, add a CDN rule skipping bot protection for"
+            echo "      the monitored paths."
+            echo ""
+          fi
+
+          if [ "$origin_ok" -eq 0 ] && [ "$n_down" -gt 0 ]; then
+            # Origin unreachable AND at least one host genuinely failing is the
+            # only combination that justifies calling this a real outage.
             verdict="ORIGIN_DOWN"
+          elif [ "$n_down" -gt 0 ] && [ "$n_answered" -gt 0 ] && [ "$n_down" -gt $((n_answered / 2)) ]; then
+            verdict="CDN_EDGE"
           elif [ "$n_down" -gt 0 ]; then
             verdict="PARTIAL"
-          else
+          elif [ "$origin_ok" -eq 0 ]; then
             verdict="ORIGIN_ONLY_DOWN"
+          elif [ "$ready_ok" -eq 0 ] && [ "$ready_code" != "CHALLENGED" ]; then
+            verdict="NOT_READY"
+          elif [ "$n_chal" -eq "$n_total" ]; then
+            verdict="ALL_CHALLENGED"
+          else
+            verdict="OK"
           fi
 
           {
@@ -136,10 +186,17 @@ jobs:
             echo "ready_code=$ready_code"
             echo "origin_code=$origin_code"
             echo "down_list=${down[*]:-none}"
+            echo "challenged_list=${challenged[*]:-none}"
           } >> "$GITHUB_OUTPUT"
 
           echo "VERDICT: $verdict"
-          [ "$verdict" = "OK" ]
+
+          # ALL_CHALLENGED is a configuration gap, not an incident. It is
+          # visible in the log without failing the job or waking anyone.
+          case "$verdict" in
+            OK|ALL_CHALLENGED) exit 0 ;;
+            *) exit 1 ;;
+          esac
 
       - name: Alert
         if: failure() && steps.probe.outputs.verdict != ''
@@ -172,6 +229,9 @@ jobs:
             ORIGIN_ONLY_DOWN)
               headline="Origin host failing (CDN hosts OK)"
               advice="The direct origin path is down while proxied hosts serve." ;;
+            NOT_READY)
+              headline="App reports NOT READY"
+              advice="The edge serves but /ready reports a failed dependency. Check the app's upstreams." ;;
             *)
               headline="Probe failed ($VERDICT)"
               advice="See the workflow run." ;;

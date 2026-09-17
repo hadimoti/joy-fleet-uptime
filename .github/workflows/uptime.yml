@@ -84,7 +84,17 @@ jobs:
             nutrized.ir
           )
           ORIGIN_HOST=direct.joyteam.ir
-          READY_URL=https://joyteam.ir/ready
+          # Readiness is probed on the origin host, NOT through the CDN, and
+          # that is deliberate. The CDN zone challenges datacenter IPs, so a
+          # probe sent through it returns an interstitial and tells us nothing
+          # about application health. The origin host is DNS-only, so this
+          # reaches the app directly and actually measures its dependencies.
+          #
+          # Residual gap, stated so nobody assumes otherwise: this does not
+          # verify the CDN path for that zone. The other zones below still
+          # answer normally and would reveal a broad CDN failure. To close the
+          # gap fully, add a CDN rule that skips bot protection for /ready.
+          READY_URL=https://direct.joyteam.ir/ready
 
           UA='uptime-probe/1.0'
 

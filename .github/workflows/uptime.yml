@@ -127,34 +127,7 @@ jobs:
           # else any DOWN -> DOWN; else any UNREACHABLE -> UNREACHABLE; else
           # CHALLENGED. Stop immediately on UP.
           probe() {
-            local url=$1 code body_file classification curl_exit attempt result i
-            local -a attempt_states=() attempt_codes=()
-            body_file=$(mktemp)
-            for attempt in 1 2; do
-              if code=$(curl -s -o "$body_file" -w '%{http_code}' \
-                         --max-time 15 --connect-timeout 10 \
-                         -A "$UA" "$url" 2>/dev/null); then
-                curl_exit=0
-              else
-                curl_exit=$?
-              fi
-              classification=$(uptime_classify_file "$code" "$body_file" "$curl_exit")
-              attempt_states+=("$classification")
-              attempt_codes+=("${code:-}")
-              if [ "$classification" = UP ]; then break; fi
-              if [ "$attempt" -eq 1 ]; then sleep 3; fi
-            done
-            rm -f "$body_file"
-            result=$(uptime_reduce_attempts "${attempt_states[@]}")
-            if [ "$result" = UP ] || [ "$result" = DOWN ]; then
-              for i in "${!attempt_states[@]}"; do
-                if [ "${attempt_states[$i]}" = "$result" ]; then
-                  echo "${attempt_codes[$i]}"
-                  return 0
-                fi
-              done
-            fi
-            echo "$result"
+            uptime_probe "$1" "$UA"
           }
 
           down=()
@@ -190,9 +163,8 @@ jobs:
             echo ""
           fi
 
-          # First classify confirmed HTTP evidence alone. Only consult an
-          # independent control host if treating transport failures as endpoint
-          # failures would actually change the fleet verdict.
+          # Consult an independent control host whenever any target is
+          # transport-ambiguous, then use its response to resolve that evidence.
           verdict=$(uptime_verdict "$origin_code" "$ready_code" -1 000 "${cdn_codes[@]}")
           if [ "$verdict" = NEEDS_CONTROL ]; then
             # Do not use curl -f: any HTTP response (including 403/429) proves

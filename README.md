@@ -25,7 +25,7 @@ see, since an app can serve a perfectly good homepage while its database is
 unreachable.
 
 Transport failures are tracked separately from HTTP errors. The control check
-is used whenever any target is transport-only. Confirmed HTTP failures continue
+runs whenever any target is transport-only. Confirmed HTTP failures continue
 to drive the verdict even if the control connection fails. Any HTTP response
 from `api.github.com` proves the runner reached the internet, including
 403/429; only a curl connection failure or HTTP 000 leaves transport-only
@@ -33,9 +33,10 @@ targets unresolved. `PROBE_NETWORK` is used only when those are the only
 non-UP signals. A challenge mixed with an unresolved transport failure is
 `PROBE_INCONCLUSIVE`, so it cannot make the run green.
 For endpoint probes, any received HTTP status is classified by status even if
-curl later exits non-zero while reading a slow or truncated body. Any challenge
-marker in the portion of the body that was read still takes precedence; an
-empty body with HTTP 200 remains `UP`. Only HTTP 000 is `UNREACHABLE`.
+curl later exits non-zero while reading a slow or truncated body. For a received
+HTTP status, any challenge marker in the portion of the body that was read still
+takes precedence; an empty body with HTTP 200 remains `UP`. HTTP 000, an empty
+status, or an invalid status is `UNREACHABLE`.
 HTTP 4xx/5xx responses without a recognized challenge page remain failures.
 Challenge detection uses specific interstitial text and challenge markers, so
 ordinary pages that mention Cloudflare are not treated as blocked.

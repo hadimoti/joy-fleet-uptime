@@ -83,8 +83,8 @@ done
 
 # Verdict table: expected, origin, /ready, control curl exit, control HTTP,
 # then one result for each CDN. A control exit of -1 asks whether control is
-# needed; the classifier returns NEEDS_CONTROL only when timeouts can change
-# the verdict.
+# needed; the classifier returns NEEDS_CONTROL whenever any target is
+# UNREACHABLE.
 while IFS='|' read -r expected origin ready control_exit control_code cdn1 cdn2 cdn3; do
   [ -n "$expected" ] || continue
   assert_verdict "$expected" "$origin" "$ready" "$control_exit" "$control_code" \
@@ -209,8 +209,48 @@ if [ "$(uptime_classify_file 503 "$file" 28)" != CHALLENGED ]; then
   printf 'Expected a received status and partial challenge body to remain CHALLENGED after curl error\n' >&2
   exit 1
 fi
-if [ "$(uptime_classify_file 000 "$file" 28)" != CHALLENGED ]; then
-  printf 'Expected a challenge marker to classify as CHALLENGED at any status\n' >&2
+if [ "$(uptime_classify_file 000 "$file" 28)" != UNREACHABLE ]; then
+  printf 'Expected HTTP 000 to classify as UNREACHABLE even with a challenge marker\n' >&2
+  exit 1
+fi
+
+# A failed retry that does not write a body must not reuse the first attempt's
+# challenge page. Also verify the shared probe path clears the file per attempt.
+probe_dir=$(mktemp -d)
+trap 'rm -f "$file"; rm -rf "$probe_dir"' EXIT
+mkdir "$probe_dir/bin"
+cat > "$probe_dir/bin/curl" <<'CURL_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+count=0
+[ -f "$PROBE_CALLS" ] && count=$(<"$PROBE_CALLS")
+count=$((count + 1))
+printf '%s' "$count" > "$PROBE_CALLS"
+output_file=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then output_file=$2; shift 2; else shift; fi
+done
+if [ "$count" -eq 1 ]; then
+  printf '%s' 'challenge-running' > "$output_file"
+  printf '200'
+  exit 0
+fi
+if [ -s "$output_file" ]; then printf stale > "$PROBE_STALE_BODY"; fi
+printf '000'
+exit 7
+CURL_STUB
+cat > "$probe_dir/bin/sleep" <<'SLEEP_STUB'
+#!/usr/bin/env bash
+exit 0
+SLEEP_STUB
+chmod +x "$probe_dir/bin/curl" "$probe_dir/bin/sleep"
+export PROBE_CALLS="$probe_dir/calls"
+export PROBE_STALE_BODY="$probe_dir/stale-body"
+PATH="$probe_dir/bin:$PATH"
+export PATH
+probe_result=$(uptime_probe https://example.test/ready test-agent)
+if [ "$probe_result" != UNREACHABLE ] || [ "$(<"$PROBE_CALLS")" != 2 ] || [ -e "$PROBE_STALE_BODY" ]; then
+  printf 'Expected challenge then bodyless HTTP 000 to produce UNREACHABLE with a cleared retry body; got %s\n' "$probe_result" >&2
   exit 1
 fi
 

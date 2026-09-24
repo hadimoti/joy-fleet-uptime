@@ -60,15 +60,14 @@ uptime_body_is_challenge() {
 
 uptime_classify() {
   local code="${1:-}" body="${2:-}" curl_exit="${3:-0}"
-  # A recognized challenge marker wins for any returned status.
-  if uptime_body_is_challenge "$body"; then
-    echo CHALLENGED
-    return
-  fi
   # A missing or malformed curl status is transport ambiguity. Normalize it
-  # here so it cannot disappear from the fleet verdict as an unknown value.
+  # before inspecting a body, which may still contain data from a prior attempt.
   if ! [[ "$code" =~ ^[0-9]{3}$ ]] || [ "$code" = "000" ]; then
     echo UNREACHABLE
+    return
+  fi
+  if uptime_body_is_challenge "$body"; then
+    echo CHALLENGED
     return
   fi
   # Receiving any HTTP status proves an HTTP response arrived, even if curl
@@ -84,11 +83,47 @@ uptime_classify() {
 
 uptime_classify_file() {
   local code="${1:-}" file="${2:-}" curl_exit="${3:-0}"
-  if [ -n "$file" ] && uptime_file_is_challenge "$file"; then
+  if ! [[ "$code" =~ ^[0-9]{3}$ ]] || [ "$code" = "000" ]; then
+    echo UNREACHABLE
+  elif [ -n "$file" ] && uptime_file_is_challenge "$file"; then
     echo CHALLENGED
   else
     uptime_classify "$code" "" "$curl_exit"
   fi
+}
+
+# Probe one target with at most two attempts. Clear the output file before each
+# request because curl can fail without opening it, leaving a prior body behind.
+uptime_probe() {
+  local url="$1" ua="$2" code body_file classification curl_exit attempt result i
+  local -a attempt_states=() attempt_codes=()
+  body_file=$(mktemp)
+  for attempt in 1 2; do
+    : > "$body_file"
+    if code=$(curl -s -o "$body_file" -w '%{http_code}' \
+               --max-time 15 --connect-timeout 10 \
+               -A "$ua" "$url" 2>/dev/null); then
+      curl_exit=0
+    else
+      curl_exit=$?
+    fi
+    classification=$(uptime_classify_file "$code" "$body_file" "$curl_exit")
+    attempt_states+=("$classification")
+    attempt_codes+=("${code:-}")
+    if [ "$classification" = UP ]; then break; fi
+    if [ "$attempt" -eq 1 ]; then sleep 3; fi
+  done
+  rm -f "$body_file"
+  result=$(uptime_reduce_attempts "${attempt_states[@]}")
+  if [ "$result" = UP ] || [ "$result" = DOWN ]; then
+    for i in "${!attempt_states[@]}"; do
+      if [ "${attempt_states[$i]}" = "$result" ]; then
+        echo "${attempt_codes[$i]}"
+        return 0
+      fi
+    done
+  fi
+  echo "$result"
 }
 
 # Reduce the classified attempts for one target. UP is conclusive and wins;

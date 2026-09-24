@@ -1,7 +1,7 @@
 # Synthetic uptime monitoring for a small set of public websites.
 #
 # It probes each site from a GitHub-hosted runner every 5 minutes and sends a
-# Telegram message when something is actually wrong.
+# Telegram message for non-green results.
 #
 # The one interesting idea here
 # -----------------------------
@@ -24,11 +24,12 @@
 # ("Just a moment...") while the site is completely healthy for real users --
 # the monitor is simply not allowed to look.
 #
-# Treating that as an outage would page a human every five minutes forever for
-# a non-problem, and the resulting alert fatigue would bury the one real outage
-# that matters. So a challenge is classified as INCONCLUSIVE, never as down,
-# and it never fails the job. To make those hosts genuinely measurable, add a
-# CDN rule that skips bot protection for the monitored paths (/ready, /live).
+# Treating that as DOWN would misreport the host's state. A challenge is
+# classified separately and never counted as UP or DOWN. The CHALLENGED verdict
+# still fails the probe step and uses the generic failure alert; ALL_CHALLENGED
+# succeeds quietly as a configuration gap. To make those hosts genuinely
+# measurable, add a CDN rule that skips bot protection for the monitored paths
+# (/ready, /live).
 #
 # Why this repository is public
 # -----------------------------
@@ -172,12 +173,11 @@ jobs:
 
           down=()
           challenged=()
+          unreachable=()
           cdn_codes=()
           for h in "${CDN_HOSTS[@]}"; do
-            code=$(probe "https://${h}/") || {
-              down+=("${h}(${code})")
-            }
-            if [ "$code" = "CHALLENGED" ]; then challenged+=("$h"); fi
+            code=$(probe "https://${h}/") || true
+            uptime_record_cdn_result "$h" "$code" down challenged unreachable
             cdn_codes+=("$code")
             printf '%-24s %s\n' "$h" "$code"
           done
@@ -230,14 +230,16 @@ jobs:
             echo "origin_code=$origin_code"
             echo "down_list=${down[*]:-none}"
             echo "challenged_list=${challenged[*]:-none}"
+            echo "unreachable_list=${unreachable[*]:-none}"
           } >> "$GITHUB_OUTPUT"
 
           echo "VERDICT: $verdict"
 
           # ALL_CHALLENGED is a configuration gap, not an incident. It is
           # visible in the log without failing the job or waking anyone.
+          # CHALLENGED follows origin/main: fail and use the generic alert.
           case "$verdict" in
-            OK|ALL_CHALLENGED|CHALLENGED) exit 0 ;;
+            OK|ALL_CHALLENGED) exit 0 ;;
             *) exit 1 ;;
           esac
 
@@ -250,6 +252,8 @@ jobs:
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           VERDICT: ${{ steps.probe.outputs.verdict || 'PROBE_CRASH' }}
           DOWN_LIST: ${{ steps.probe.outputs.down_list }}
+          CHALLENGED_LIST: ${{ steps.probe.outputs.challenged_list }}
+          UNREACHABLE_LIST: ${{ steps.probe.outputs.unreachable_list }}
           READY_CODE: ${{ steps.probe.outputs.ready_code }}
           ORIGIN_CODE: ${{ steps.probe.outputs.origin_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -258,8 +262,8 @@ jobs:
           response_file=$(mktemp)
           trap 'rm -f "$response_file"' EXIT
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "::warning::Telegram secrets not set; alert not delivered"
-            exit 0
+            echo "::error::Telegram alert failed (required secrets are missing)"
+            exit 1
           fi
 
           case "$VERDICT" in
@@ -273,8 +277,8 @@ jobs:
               headline="Partial outage"
               advice="Some hosts are failing while others serve normally. Check the listed hosts." ;;
             ORIGIN_ONLY_DOWN)
-              headline="Origin host failing (CDN hosts OK)"
-              advice="The direct origin path is down while proxied hosts serve." ;;
+              headline="Origin host failure"
+              advice="The origin host failed the probe. CDN host states are listed separately and do not change this origin result." ;;
             NOT_READY)
               headline="App reports NOT READY"
               advice="/ready reports a failed dependency. Check the app and review every listed failing host, including CDN paths." ;;
@@ -286,8 +290,8 @@ jobs:
               advice="See the workflow run." ;;
           esac
 
-          text=$(printf '%s\n\ndown: %s\nready: %s\norigin: %s\n\n%s\n\n%s' \
-            "$headline" "$DOWN_LIST" "$READY_CODE" "$ORIGIN_CODE" "$advice" "$RUN_URL")
+          text=$(printf '%s\n\ndown: %s\nchallenged: %s\nunreachable: %s\nready: %s\norigin: %s\n\n%s\n\n%s' \
+            "$headline" "$DOWN_LIST" "$CHALLENGED_LIST" "$UNREACHABLE_LIST" "$READY_CODE" "$ORIGIN_CODE" "$advice" "$RUN_URL")
 
           if status=$(curl -s -o "$response_file" -w '%{http_code}' --max-time 20 \
             --data-urlencode "chat_id=${CHAT_ID}" \

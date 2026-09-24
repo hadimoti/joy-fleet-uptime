@@ -58,7 +58,9 @@ Verdict precedence is `ORIGIN_DOWN`, `ORIGIN_ONLY_DOWN`, `NOT_READY`,
 healthy origin even when most CDN hosts also return failures; the alert includes
 the failing CDN host list for investigation. Challenges are neither `UP` nor
 `DOWN`; without any independent `UP` evidence, they produce a failed,
-inconclusive run. Across retries, any ordinary received 4xx/5xx is retained
+inconclusive run. A `CHALLENGED` verdict fails the probe step and invokes the
+generic failure alert; `ALL_CHALLENGED` exits successfully without an alert.
+Across retries, any ordinary received 4xx/5xx is retained
 even if a later attempt returns HTTP 000 or succeeds.
 
 ## Why this repository is public
@@ -85,8 +87,10 @@ workflows triggered by pull requests from forks, so a fork cannot read them.
    with monitoring that looks healthy but can never actually reach you.
 3. Run it once by hand: **Actions → uptime → Run workflow**.
    The optional `drill` checkbox sends one `[DRILL]` Telegram delivery test
-   with the run link and UTC timestamp. It still runs the probes and never
-   uses outage wording. The drill is successful only when Telegram returns
+   with the run link and UTC timestamp. The `[DRILL]` message itself never
+   uses outage wording. If a probe also finds a real failure, its separate
+   failure alert may accompany the drill and use outage wording. The drill is
+   successful only when Telegram returns
    HTTP 200 and confirms `ok: true`; missing secrets or an unconfirmed response
    fail the drill step. Scheduled runs cannot send a drill.
 

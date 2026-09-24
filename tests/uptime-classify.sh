@@ -63,6 +63,7 @@ while IFS='|' read -r expected origin ready control_exit control_code cdn1 cdn2 
     "$cdn1" "$cdn2" "$cdn3"
 done <<'VERDICTS'
 OK|200|200|0|403|UP|UP|UP
+CHALLENGED|200|200|0|403|CHALLENGED|UP|UP
 CHALLENGED|CHALLENGED|200|0|403|UP|UP|UP
 ALL_CHALLENGED|200|200|0|403|CHALLENGED|CHALLENGED|CHALLENGED
 CDN_EDGE|200|200|0|403|503|503|UP
@@ -104,6 +105,29 @@ assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 0 429 UNREACHABLE
 # A challenge is neutral evidence. It cannot turn the remaining timeout into
 # an origin outage; with a reachable control, that timeout is only PARTIAL.
 assert_verdict PARTIAL 200 200 0 403 CHALLENGED UNREACHABLE UP
+
+# A CDN challenge is an inconclusive fleet verdict when otherwise healthy
+# responses provide positive health evidence. Confirmed failures retain their
+# higher priority.
+assert_verdict CHALLENGED 200 200 0 403 UP CHALLENGED UP
+assert_verdict PARTIAL 200 200 0 403 503 CHALLENGED UP
+assert_verdict ORIGIN_ONLY_DOWN 503 200 0 403 CHALLENGED UP UP
+
+# Only received ordinary HTTP failures enter down; challenge and transport
+# outcomes have their own lists.
+down_list=()
+challenged_list=()
+unreachable_list=()
+uptime_record_cdn_result joy.example 403 down_list challenged_list unreachable_list
+uptime_record_cdn_result challenge.example CHALLENGED down_list challenged_list unreachable_list
+uptime_record_cdn_result timeout.example UNREACHABLE down_list challenged_list unreachable_list
+uptime_record_cdn_result unavailable.example 503 down_list challenged_list unreachable_list
+if [ "${down_list[*]}" != 'joy.example(403) unavailable.example(503)' ] || \
+   [ "${challenged_list[*]}" != 'challenge.example' ] || \
+   [ "${unreachable_list[*]}" != 'timeout.example' ]; then
+  printf 'Expected confirmed failures, challenges, and unreachable hosts to use separate lists\n' >&2
+  exit 1
+fi
 
 file=$(mktemp)
 trap 'rm -f "$file"' EXIT

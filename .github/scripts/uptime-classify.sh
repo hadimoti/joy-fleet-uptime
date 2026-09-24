@@ -20,16 +20,18 @@
 # any    | any   | no DOWN/U; all CDN CHALLENGED      | n/a           | ALL_CHALLENGED if any UP
 # C     | any   | no DOWN/U                          | n/a           | CHALLENGED
 # any    | C     | no DOWN/U                          | n/a           | CHALLENGED
-# any    | any   | no DOWN/U; some CDN CHALLENGED     | n/a           | CHALLENGED
+# any    | any   | no DOWN/U; any CDN CHALLENGED      | n/a           | CHALLENGED
 # any    | any   | only C, no U, no positive UP       | n/a           | PROBE_INCONCLUSIVE
-# any    | any   | only UP/C, no U                    | n/a           | OK/CHALLENGED*
+# any    | any   | only UP, no C/U                    | n/a           | OK
 # any    | any   | any U                             | not needed    | NEEDS_CONTROL
 # any    | any   | any U, confirmed DOWN             | connection fail| confirmed result above
 # any    | any   | any U, only UP/C/U                | connection fail| PROBE_INCONCLUSIVE if C, else PROBE_NETWORK
 # any    | any   | any U                             | HTTP response | recompute with each U as DOWN
-# *No challenge is counted as UP or DOWN. A challenge with no independent UP
-#  evidence is PROBE_INCONCLUSIVE; otherwise it is CHALLENGED (or
-#  ALL_CHALLENGED when every CDN host is challenged and origin/ready are UP).
+# A challenge is never UP/OK and never DOWN. Without independent UP evidence,
+#  it is PROBE_INCONCLUSIVE; otherwise it is CHALLENGED (or ALL_CHALLENGED
+#  when every CDN host is challenged and origin/ready are UP).
+# Workflow handling: CHALLENGED fails the probe step and invokes the generic
+#  failure alert; ALL_CHALLENGED succeeds without an alert, matching origin/main.
 # A control HTTP response of any status is reachable; curl failure/HTTP 000 is
 # connection failure. Control is otherwise not needed.
 
@@ -98,6 +100,19 @@ uptime_keep_http_failure() {
   fi
 }
 
+# Keep alert lists aligned with confirmed evidence. A challenge and a transport
+# failure are reported separately and must never be presented as a confirmed
+# HTTP outage.
+uptime_record_cdn_result() {
+  local host="$1" code="$2"
+  local -n down_ref="$3" challenged_ref="$4" unreachable_ref="$5"
+  case "$code" in
+    CHALLENGED) challenged_ref+=("$host") ;;
+    UNREACHABLE) unreachable_ref+=("$host") ;;
+    4*|5*) down_ref+=("${host}(${code})") ;;
+  esac
+}
+
 # Produce the fleet verdict for one interpretation of transport-ambiguous
 # targets. "exclude" preserves only confirmed HTTP evidence; "down" treats
 # UNREACHABLE targets as endpoint failures (after the control host reached HTTP).
@@ -150,6 +165,8 @@ uptime_verdict_for() {
   elif [ "$n_chal" -eq "$n_total" ] && [ "$n_total" -gt 0 ]; then
     echo ALL_CHALLENGED
   elif [ "$origin_challenged" -eq 1 ] || [ "$ready_challenged" -eq 1 ]; then
+    echo CHALLENGED
+  elif [ "$n_chal" -gt 0 ]; then
     echo CHALLENGED
   else
     echo OK

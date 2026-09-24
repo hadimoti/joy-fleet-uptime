@@ -36,9 +36,10 @@ ordinary pages that mention Cloudflare are not treated as blocked.
 
 | Probe evidence | Control response | Verdict handling |
 | :--- | :--- | :--- |
-| Confirmed HTTP failures already determine the verdict; unrelated target times out | Connection failure | Keep the HTTP-driven verdict (for example, origin 503 plus CDN 503 remains `ORIGIN_DOWN`). |
+| Confirmed HTTP failures already establish a non-`OK` verdict with timeouts excluded | Connection failure or HTTP 000 | Keep that confirmed verdict (for example, origin 503 plus CDN 200 plus a CDN timeout remains `ORIGIN_ONLY_DOWN`; a partial CDN failure plus timeout remains `PARTIAL`). |
 | Timeouts could change the verdict | Any HTTP status, including 403/429 | Treat timed-out targets as failures and classify the endpoints. |
-| Timeouts could change the verdict | Curl connection failure or HTTP 000 | Report `PROBE_NETWORK`; do not infer endpoint failures from those timeouts. |
+| Only transport failures can produce a non-`OK` verdict (or every CDN is challenged) | Curl connection failure or HTTP 000 | Report `PROBE_NETWORK`; do not infer endpoint failures from those timeouts. |
+| Timeouts could change the verdict | Non-000 HTTP status, even if curl exits non-zero after receiving it | Treat the control host as reached and classify timed-out targets as failures. |
 | Challenge response plus a timeout | Any HTTP status | Ignore the challenge as health evidence; resolve the timeout using the control result. |
 
 ## Why this repository is public

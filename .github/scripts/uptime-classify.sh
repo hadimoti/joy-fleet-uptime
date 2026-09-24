@@ -131,8 +131,15 @@ uptime_verdict() {
     echo "$confirmed_verdict"
   elif [ "$control_exit" = -1 ]; then
     echo NEEDS_CONTROL
-  elif [ "$control_exit" -ne 0 ] || [ "$control_code" = 000 ] || [ -z "$control_code" ]; then
-    echo PROBE_NETWORK
+  elif [ "$control_code" = 000 ] || [ -z "$control_code" ]; then
+    # On control failure, keep any verdict already supported by HTTP evidence.
+    # PROBE_NETWORK is only justified when transport-ambiguous targets are the
+    # sole reason the down interpretation differs from confirmed evidence.
+    if [ "$confirmed_verdict" != OK ] && [ "$confirmed_verdict" != ALL_CHALLENGED ]; then
+      echo "$confirmed_verdict"
+    else
+      echo PROBE_NETWORK
+    fi
   else
     # Any HTTP response (including 403/429) confirms the runner reached out.
     echo "$resolved_verdict"

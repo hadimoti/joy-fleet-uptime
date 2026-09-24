@@ -38,13 +38,38 @@ assert_verdict() {
   fi
 }
 
-# Existing HTTP failures remain decisive even when a separate target times out
-# and the optional control request itself cannot connect.
-assert_verdict ORIGIN_DOWN 503 200 7 000 503 UNREACHABLE
+# Verdict table: expected, origin, /ready, control curl exit, control HTTP,
+# then one result for each CDN. A control exit of -1 asks whether control is
+# needed; the classifier returns NEEDS_CONTROL only when timeouts can change
+# the verdict.
+while IFS='|' read -r expected origin ready control_exit control_code cdn1 cdn2 cdn3; do
+  [ -n "$expected" ] || continue
+  assert_verdict "$expected" "$origin" "$ready" "$control_exit" "$control_code" \
+    "$cdn1" "$cdn2" "$cdn3"
+done <<'VERDICTS'
+OK|200|200|0|403|UP|UP|UP
+CHALLENGED|CHALLENGED|200|0|403|UP|UP|UP
+ALL_CHALLENGED|200|200|0|403|CHALLENGED|CHALLENGED|CHALLENGED
+CDN_EDGE|200|200|0|403|503|503|UP
+ORIGIN_ONLY_DOWN|503|200|0|403|UP|UP|UP
+ORIGIN_DOWN|503|200|0|403|503|UP|UP
+NOT_READY|200|503|0|403|UP|UP|UP
+NEEDS_CONTROL|UNREACHABLE|200|-1|000|UP|UP|UP
+ORIGIN_ONLY_DOWN|UNREACHABLE|200|0|403|UP|UP|UP
+ORIGIN_ONLY_DOWN|503|200|7|000|UP|UNREACHABLE|UP
+PARTIAL|200|200|7|000|503|UNREACHABLE|UP
+NOT_READY|200|503|7|000|UP|UNREACHABLE|UP
+PROBE_NETWORK|UNREACHABLE|UNREACHABLE|7|000|UNREACHABLE|UNREACHABLE|UNREACHABLE
+ORIGIN_ONLY_DOWN|UNREACHABLE|200|56|403|UP|UP|UP
+VERDICTS
 
-# If every target is transport-ambiguous, a control connection failure means
-# the monitor cannot distinguish endpoint failures from a runner outage.
-assert_verdict PROBE_NETWORK UNREACHABLE UNREACHABLE 7 000 UNREACHABLE
+# Exact two-CDN regression: one successful HTTP response and one timeout must
+# not hide the confirmed origin failure when the control host is unreachable.
+assert_verdict ORIGIN_ONLY_DOWN 503 200 7 000 UP UNREACHABLE
+
+# A reached control host resolves transport ambiguity despite curl reporting a
+# partial-transfer error. Its HTTP 403 is still evidence of connectivity.
+assert_verdict ORIGIN_ONLY_DOWN UNREACHABLE 200 56 403 UP UP
 
 # An HTTP response proves connectivity regardless of its HTTP status. In
 # particular, GitHub's unauthenticated API may answer with 403 or 429.

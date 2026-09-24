@@ -47,6 +47,13 @@ workflows triggered by pull requests from forks, so a fork cannot read them.
    every alert fails with `403: bot can't initiate conversation`, leaving you
    with monitoring that looks healthy but can never actually reach you.
 3. Run it once by hand: **Actions → uptime → Run workflow**.
+   The optional `drill` checkbox sends one `[DRILL]` Telegram delivery test
+   with the run link and UTC timestamp. It still runs the probes and never
+   uses outage wording.
+
+Challenge response markers are checked on every HTTP status. A marked response
+is reported as challenged and is not counted as healthy or down. The workflow
+runs the offline classification contract before probing.
 
 ## Limitations, stated plainly
 
@@ -54,5 +61,5 @@ workflows triggered by pull requests from forks, so a fork cannot read them.
   under platform load. This is good monitoring, not a hard SLA.
 - Scheduled workflows are **disabled automatically after 60 days** without
   repository activity.
-- A green run proves the *probe* works. The alert step only executes on failure,
-  so a healthy fleet never exercises message delivery — test that separately.
+- A green run proves the *probe* works. Use the dispatch `drill` option to
+  exercise Telegram delivery without reporting an outage.

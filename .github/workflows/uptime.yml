@@ -50,6 +50,12 @@ on:
     # platform load, so treat this as very good monitoring, not a hard SLA.
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      drill:
+        description: Send a labelled Telegram delivery test
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -65,11 +71,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      - name: Check out workflow files
+        uses: actions/checkout@v4
+
+      - name: Classification contract
+        shell: bash
+        run: bash tests/uptime-classify.sh
+
       - name: Probe
         id: probe
         shell: bash
         run: |
           set -uo pipefail
+          source .github/scripts/uptime-classify.sh
 
           CDN_HOSTS=(
             joyteam.ir
@@ -98,37 +112,33 @@ jobs:
 
           UA='uptime-probe/1.0'
 
-          # Echoes one of:
-          #   <2xx/3xx code>  healthy        (exit 0)
-          #   CHALLENGED      CDN interstitial, inconclusive   (exit 0)
-          #   <code>|000      genuine failure                  (exit 1)
+          # Echoes a successful HTTP code, CHALLENGED, or the last failed code.
           #
           # Two attempts before calling anything down, so a single transient
           # DNS or TLS blip on a shared runner never wakes anyone up.
           probe() {
-            local url=$1 code
+            local url=$1 code body_file classification
+            body_file=$(mktemp)
             for _ in 1 2; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' \
+              code=$(curl -s -o "$body_file" -w '%{http_code}' \
                        --max-time 15 --connect-timeout 10 \
-                       -A "$UA" "$url" 2>/dev/null)
-              case "$code" in
-                2*|3*)
+                       -A "$UA" "$url" 2>/dev/null) || true
+              classification=$(uptime_classify_file "$code" "$body_file")
+              case "$classification" in
+                UP)
+                  rm -f "$body_file"
                   echo "$code"
                   return 0
                   ;;
-                403|503)
-                  # Separate a CDN challenge from a genuine 403/503 by looking
-                  # for the interstitial's own markers in the body.
-                  if curl -s --max-time 15 -A "$UA" "$url" 2>/dev/null \
-                       | head -c 2000 \
-                       | grep -qiE 'just a moment|cf-browser-verification|cf_chl|challenge-platform|__cf_chl|cdn-cgi/challenge'; then
-                    echo "CHALLENGED"
-                    return 0
-                  fi
+                CHALLENGED)
+                  rm -f "$body_file"
+                  echo "CHALLENGED"
+                  return 0
                   ;;
               esac
               sleep 3
             done
+            rm -f "$body_file"
             echo "${code:-000}"
             return 1
           }
@@ -152,8 +162,12 @@ jobs:
 
           origin_ok=0
           case "$origin_code" in 2*|3*) origin_ok=1 ;; esac
+          origin_challenged=0
+          [ "$origin_code" = "CHALLENGED" ] && origin_challenged=1
           ready_ok=0
           case "$ready_code" in 2*|3*) ready_ok=1 ;; esac
+          ready_challenged=0
+          [ "$ready_code" = "CHALLENGED" ] && ready_challenged=1
 
           n_down=${#down[@]}
           n_chal=${#challenged[@]}
@@ -173,20 +187,22 @@ jobs:
             echo ""
           fi
 
-          if [ "$origin_ok" -eq 0 ] && [ "$n_down" -gt 0 ]; then
+          if [ "$origin_ok" -eq 0 ] && [ "$origin_challenged" -eq 0 ] && [ "$n_down" -gt 0 ]; then
             # Origin unreachable AND at least one host genuinely failing is the
             # only combination that justifies calling this a real outage.
             verdict="ORIGIN_DOWN"
-          elif [ "$n_down" -gt 0 ] && [ "$n_answered" -gt 0 ] && [ "$n_down" -gt $((n_answered / 2)) ]; then
+          elif [ "$origin_ok" -eq 1 ] && [ "$n_down" -gt 0 ] && [ "$n_answered" -gt 0 ] && [ "$n_down" -gt $((n_answered / 2)) ]; then
             verdict="CDN_EDGE"
           elif [ "$n_down" -gt 0 ]; then
             verdict="PARTIAL"
-          elif [ "$origin_ok" -eq 0 ]; then
+          elif [ "$origin_ok" -eq 0 ] && [ "$origin_challenged" -eq 0 ]; then
             verdict="ORIGIN_ONLY_DOWN"
           elif [ "$ready_ok" -eq 0 ] && [ "$ready_code" != "CHALLENGED" ]; then
             verdict="NOT_READY"
           elif [ "$n_chal" -eq "$n_total" ]; then
             verdict="ALL_CHALLENGED"
+          elif [ "$origin_challenged" -eq 1 ] || [ "$ready_challenged" -eq 1 ]; then
+            verdict="CHALLENGED"
           else
             verdict="OK"
           fi
@@ -204,25 +220,41 @@ jobs:
           # ALL_CHALLENGED is a configuration gap, not an incident. It is
           # visible in the log without failing the job or waking anyone.
           case "$verdict" in
-            OK|ALL_CHALLENGED) exit 0 ;;
+            OK|ALL_CHALLENGED|CHALLENGED) exit 0 ;;
             *) exit 1 ;;
           esac
 
       - name: Alert
-        if: failure() && steps.probe.outputs.verdict != ''
+        if: always() && ((github.event_name == 'workflow_dispatch' && inputs.drill) || failure())
         shell: bash
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          VERDICT: ${{ steps.probe.outputs.verdict }}
+          VERDICT: ${{ steps.probe.outputs.verdict || 'PROBE_CRASH' }}
           DOWN_LIST: ${{ steps.probe.outputs.down_list }}
           READY_CODE: ${{ steps.probe.outputs.ready_code }}
           ORIGIN_CODE: ${{ steps.probe.outputs.origin_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRILL: ${{ github.event_name == 'workflow_dispatch' && inputs.drill || false }}
         run: |
           set -uo pipefail
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
             echo "::warning::Telegram secrets not set; alert not delivered"
+            exit 0
+          fi
+
+          if [ "$DRILL" = "true" ]; then
+            timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            text=$(printf '[DRILL] Telegram delivery test\n\nThis is a test message.\nTimestamp: %s\nRun: %s' \
+              "$timestamp" "$RUN_URL")
+            status=$(curl -s -o "$response_file" -w '%{http_code}' --max-time 20 \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${text}" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null || true)
+            printf 'Telegram HTTP status: %s\n' "${status:-000}"
             exit 0
           fi
 
@@ -250,8 +282,9 @@ jobs:
           text=$(printf '%s\n\ndown: %s\nready: %s\norigin: %s\n\n%s\n\n%s' \
             "$headline" "$DOWN_LIST" "$READY_CODE" "$ORIGIN_CODE" "$advice" "$RUN_URL")
 
-          curl -s -o /dev/null --max-time 20 \
+          status=$(curl -s -o "$response_file" -w '%{http_code}' --max-time 20 \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" \
             --data-urlencode "disable_web_page_preview=true" \
-            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null || true)
+          printf 'Telegram HTTP status: %s\n' "${status:-000}"

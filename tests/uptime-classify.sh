@@ -28,6 +28,33 @@ assert_classification UNREACHABLE 000 0 ''
 assert_classification UNREACHABLE 200 7 'partial body'
 assert_classification UNKNOWN ERR 0 ''
 
+assert_verdict() {
+  local expected="$1" actual
+  shift
+  actual=$(uptime_verdict "$@")
+  if [ "$actual" != "$expected" ]; then
+    printf 'Expected verdict %s, got %s\n' "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+# Existing HTTP failures remain decisive even when a separate target times out
+# and the optional control request itself cannot connect.
+assert_verdict ORIGIN_DOWN 503 200 7 000 503 UNREACHABLE
+
+# If every target is transport-ambiguous, a control connection failure means
+# the monitor cannot distinguish endpoint failures from a runner outage.
+assert_verdict PROBE_NETWORK UNREACHABLE UNREACHABLE 7 000 UNREACHABLE
+
+# An HTTP response proves connectivity regardless of its HTTP status. In
+# particular, GitHub's unauthenticated API may answer with 403 or 429.
+assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 0 403 UNREACHABLE
+assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 0 429 UNREACHABLE
+
+# A challenge is neutral evidence. It cannot turn the remaining timeout into
+# an origin outage; with a reachable control, that timeout is only PARTIAL.
+assert_verdict PARTIAL 200 200 0 403 CHALLENGED UNREACHABLE UP
+
 file=$(mktemp)
 trap 'rm -f "$file"' EXIT
 printf '%s' 'ordinary content followed by checking+your+browser' > "$file"

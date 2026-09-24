@@ -24,13 +24,22 @@ application's own dependencies are healthy — something a homepage check cannot
 see, since an app can serve a perfectly good homepage while its database is
 unreachable.
 
-Transport failures are tracked separately from HTTP errors. If a probe cannot
-connect, the workflow checks `api.github.com` with bounded timeouts; if that
-control request also fails, the run reports `PROBE_NETWORK` and does not infer
-a fleet outage from the runner's connectivity problem. HTTP 4xx/5xx responses
-without a recognized challenge page remain failures. Challenge detection uses
-specific interstitial text and challenge markers, so ordinary pages that
-mention Cloudflare are not treated as blocked.
+Transport failures are tracked separately from HTTP errors. The control check
+is used only when counting timeouts as endpoint failures would change the
+verdict. Confirmed HTTP failures continue to drive the verdict even if the
+control connection fails. Any HTTP response from `api.github.com` proves the
+runner reached the internet, including 403/429; only a curl connection failure
+or HTTP 000 produces `PROBE_NETWORK` when the verdict depends on timeouts.
+HTTP 4xx/5xx responses without a recognized challenge page remain failures.
+Challenge detection uses specific interstitial text and challenge markers, so
+ordinary pages that mention Cloudflare are not treated as blocked.
+
+| Probe evidence | Control response | Verdict handling |
+| :--- | :--- | :--- |
+| Confirmed HTTP failures already determine the verdict; unrelated target times out | Connection failure | Keep the HTTP-driven verdict (for example, origin 503 plus CDN 503 remains `ORIGIN_DOWN`). |
+| Timeouts could change the verdict | Any HTTP status, including 403/429 | Treat timed-out targets as failures and classify the endpoints. |
+| Timeouts could change the verdict | Curl connection failure or HTTP 000 | Report `PROBE_NETWORK`; do not infer endpoint failures from those timeouts. |
+| Challenge response plus a timeout | Any HTTP status | Ignore the challenge as health evidence; resolve the timeout using the control result. |
 
 ## Why this repository is public
 

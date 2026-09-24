@@ -154,49 +154,27 @@ jobs:
 
           down=()
           challenged=()
-          unreachable_count=0
+          cdn_codes=()
           for h in "${CDN_HOSTS[@]}"; do
             code=$(probe "https://${h}/") || {
               down+=("${h}(${code})")
-              if [ "$code" = "UNREACHABLE" ]; then
-                unreachable_count=$((unreachable_count + 1))
-              fi
             }
             if [ "$code" = "CHALLENGED" ]; then challenged+=("$h"); fi
+            cdn_codes+=("$code")
             printf '%-24s %s\n' "$h" "$code"
           done
 
           origin_code=$(probe "https://${ORIGIN_HOST}/") || true
-          if [ "$origin_code" = "UNREACHABLE" ]; then
-            unreachable_count=$((unreachable_count + 1))
-          fi
           printf '%-24s %s\n' "$ORIGIN_HOST" "$origin_code"
 
           # The readiness endpoint reports whether the app's own dependencies
           # are healthy, which a plain homepage check cannot see: an app can
           # serve a perfectly good homepage while its database is unreachable.
           ready_code=$(probe "$READY_URL") || true
-          if [ "$ready_code" = "UNREACHABLE" ]; then
-            unreachable_count=$((unreachable_count + 1))
-          fi
           printf '%-24s %s\n' 'ready' "$ready_code"
 
-          origin_ok=0
-          case "$origin_code" in 2*|3*) origin_ok=1 ;; esac
-          origin_challenged=0
-          [ "$origin_code" = "CHALLENGED" ] && origin_challenged=1
-          ready_ok=0
-          case "$ready_code" in 2*|3*) ready_ok=1 ;; esac
-          ready_challenged=0
-          [ "$ready_code" = "CHALLENGED" ] && ready_challenged=1
-
-          n_down=${#down[@]}
           n_chal=${#challenged[@]}
           n_total=${#CDN_HOSTS[@]}
-          # A challenged host is inconclusive: the monitor was denied a look,
-          # which says nothing about whether real users can load the site. Only
-          # hosts that actually answered count toward the verdict.
-          n_answered=$((n_total - n_chal))
 
           if [ "$n_chal" -gt 0 ]; then
             echo ""
@@ -208,36 +186,24 @@ jobs:
             echo ""
           fi
 
-          control_ok=1
-          if [ "$unreachable_count" -gt 0 ]; then
-            # A runner-wide network/TLS outage must not become a fleet outage.
-            # This independent public control endpoint uses bounded timeouts.
-            if ! curl -fsS -o /dev/null --max-time 10 --connect-timeout 5 \
-                    https://api.github.com/ 2>/dev/null; then
-              control_ok=0
+          # First classify confirmed HTTP evidence alone. Only consult an
+          # independent control host if treating transport failures as endpoint
+          # failures would actually change the fleet verdict.
+          verdict=$(uptime_verdict "$origin_code" "$ready_code" -1 000 "${cdn_codes[@]}")
+          if [ "$verdict" = NEEDS_CONTROL ]; then
+            # Do not use curl -f: any HTTP response (including 403/429) proves
+            # the runner reached the public internet. Only connection failure
+            # or HTTP 000 means PROBE_NETWORK when the verdict depends on it.
+            if control_code=$(curl -s -o /dev/null -w '%{http_code}' \
+                --max-time 10 --connect-timeout 5 \
+                https://api.github.com/ 2>/dev/null); then
+              control_exit=0
+            else
+              control_exit=$?
             fi
-          fi
-
-          if [ "$control_ok" -eq 0 ]; then
-            verdict="PROBE_NETWORK"
-          elif [ "$origin_ok" -eq 0 ] && [ "$origin_challenged" -eq 0 ] && [ "$n_down" -gt 0 ]; then
-            # Origin unreachable AND at least one host genuinely failing is the
-            # only combination that justifies calling this a real outage.
-            verdict="ORIGIN_DOWN"
-          elif [ "$origin_ok" -eq 1 ] && [ "$n_down" -gt 0 ] && [ "$n_answered" -gt 0 ] && [ "$n_down" -gt $((n_answered / 2)) ]; then
-            verdict="CDN_EDGE"
-          elif [ "$n_down" -gt 0 ]; then
-            verdict="PARTIAL"
-          elif [ "$origin_ok" -eq 0 ] && [ "$origin_challenged" -eq 0 ]; then
-            verdict="ORIGIN_ONLY_DOWN"
-          elif [ "$ready_ok" -eq 0 ] && [ "$ready_code" != "CHALLENGED" ]; then
-            verdict="NOT_READY"
-          elif [ "$n_chal" -eq "$n_total" ]; then
-            verdict="ALL_CHALLENGED"
-          elif [ "$origin_challenged" -eq 1 ] || [ "$ready_challenged" -eq 1 ]; then
-            verdict="CHALLENGED"
-          else
-            verdict="OK"
+            control_code=${control_code:-000}
+            printf '%-24s %s\n' 'api.github.com' "$control_code"
+            verdict=$(uptime_verdict "$origin_code" "$ready_code" "$control_exit" "$control_code" "${cdn_codes[@]}")
           fi
 
           {

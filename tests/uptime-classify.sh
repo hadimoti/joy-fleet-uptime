@@ -24,8 +24,11 @@ assert_classification UP 200 0 'ordinary successful response'
 assert_classification UP 302 0 'ordinary redirect'
 assert_classification DOWN 403 0 'ordinary forbidden response'
 assert_classification DOWN 503 0 'ordinary unavailable response'
+assert_classification DOWN 503 18 'truncated unavailable response'
+assert_classification DOWN 503 28 'slow unavailable response'
+assert_classification UP 200 28 ''
 assert_classification UNREACHABLE 000 0 ''
-assert_classification UNREACHABLE 200 7 'partial body'
+assert_classification UP 200 7 'partial body'
 assert_classification UNKNOWN ERR 0 ''
 
 assert_verdict() {
@@ -61,6 +64,7 @@ PARTIAL|200|200|7|000|503|UNREACHABLE|UP
 NOT_READY|200|503|7|000|UP|UNREACHABLE|UP
 PROBE_NETWORK|UNREACHABLE|UNREACHABLE|7|000|UNREACHABLE|UNREACHABLE|UNREACHABLE
 ORIGIN_ONLY_DOWN|UNREACHABLE|200|56|403|UP|UP|UP
+ORIGIN_DOWN|503|200|28|000|503|503|UP
 VERDICTS
 
 # Exact two-CDN regression: one successful HTTP response and one timeout must
@@ -71,7 +75,8 @@ assert_verdict ORIGIN_ONLY_DOWN 503 200 7 000 UP UNREACHABLE
 # partial-transfer error. Its HTTP 403 is still evidence of connectivity.
 assert_verdict ORIGIN_ONLY_DOWN UNREACHABLE 200 56 403 UP UP
 
-# An HTTP response proves connectivity regardless of its HTTP status. In
+# An HTTP response proves connectivity regardless of its HTTP status or a
+# later curl transfer error. In
 # particular, GitHub's unauthenticated API may answer with 403 or 429.
 assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 0 403 UNREACHABLE
 assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 0 429 UNREACHABLE
@@ -110,6 +115,11 @@ fi
 printf '%s' 'ordinary response' > "$file"
 if [ "$(uptime_classify_file 403 "$file")" != DOWN ]; then
   printf 'Expected an unmarked HTTP 403 to remain DOWN\n' >&2
+  exit 1
+fi
+printf '%s' '<title>Just a moment...</title>' > "$file"
+if [ "$(uptime_classify_file 503 "$file" 28)" != CHALLENGED ]; then
+  printf 'Expected a received status and partial challenge body to remain CHALLENGED after curl error\n' >&2
   exit 1
 fi
 if [ "$(uptime_classify_file 000 "$file" 28)" != UNREACHABLE ]; then

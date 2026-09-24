@@ -30,6 +30,10 @@ verdict. Confirmed HTTP failures continue to drive the verdict even if the
 control connection fails. Any HTTP response from `api.github.com` proves the
 runner reached the internet, including 403/429; only a curl connection failure
 or HTTP 000 produces `PROBE_NETWORK` when the verdict depends on timeouts.
+For endpoint probes, any received HTTP status is classified by status even if
+curl later exits non-zero while reading a slow or truncated body. Any challenge
+marker in the portion of the body that was read still takes precedence; an
+empty body with HTTP 200 remains `UP`. Only HTTP 000 is `UNREACHABLE`.
 HTTP 4xx/5xx responses without a recognized challenge page remain failures.
 Challenge detection uses specific interstitial text and challenge markers, so
 ordinary pages that mention Cloudflare are not treated as blocked.
@@ -74,6 +78,14 @@ workflows triggered by pull requests from forks, so a fork cannot read them.
 Recognized challenge response markers are checked on every HTTP status. A
 marked response is reported as challenged and is not counted as healthy or
 down. The workflow runs the offline classification contract before probing.
+Each endpoint gets two attempts with a 15-second curl limit and a 3-second
+sleep only between attempts. The worst probe path is 12 targets × 33 seconds
+(396 seconds), plus the 10-second control request, 20-second failure alert,
+and optional 20-second delivery drill: 446 seconds total. The probe step has
+an 8-minute limit and the job an 18-minute limit for checkout, checks, and
+runner overhead. The workflow concurrency group lets one run finish before a
+new pending run proceeds, so an alerting run is not cancelled when the
+five-minute schedule fires again.
 
 ## Limitations, stated plainly
 

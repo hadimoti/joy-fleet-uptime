@@ -61,26 +61,34 @@ permissions:
   contents: read
 
 concurrency:
-  # If several delayed runs queue up, only the newest matters. Without this a
-  # backlog could fire a burst of duplicate alerts for one incident.
+  # Do not cancel a running probe or its alert. GitHub keeps at most one pending
+  # run in this group, replacing older pending runs if schedule triggers pile up.
   group: uptime
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Worst path: 12 targets x (2 x 15s curl + one 3s inter-attempt sleep) =
+    # 396s, plus control 10s, alert 20s, and optional drill 20s = 446s (7m26s).
+    # The probe step gets 8m; 18m for the job leaves 10m34s for checkout,
+    # contract checks, step startup, and other runner overhead. The 5m schedule
+    # can overlap in time; non-cancelling concurrency preserves active alerts.
+    timeout-minutes: 18
     steps:
       - name: Check out workflow files
         uses: actions/checkout@v4
+        timeout-minutes: 2
 
       - name: Classification contract
         shell: bash
         run: bash tests/uptime-classify.sh
+        timeout-minutes: 2
 
       - name: Probe
         id: probe
         shell: bash
+        timeout-minutes: 8
         run: |
           set -uo pipefail
           source .github/scripts/uptime-classify.sh
@@ -113,14 +121,15 @@ jobs:
           UA='uptime-probe/1.0'
 
           # Echoes a successful HTTP code, CHALLENGED, a failed HTTP code, or
-          # UNREACHABLE when curl did not receive an HTTP response.
+          # UNREACHABLE only when curl received HTTP 000. If curl received a
+          # status before a body transfer error, classify by that status.
           #
           # Two attempts before calling anything down, so a single transient
           # DNS or TLS blip on a shared runner never wakes anyone up.
           probe() {
-            local url=$1 code body_file classification curl_exit
+            local url=$1 code body_file classification curl_exit attempt
             body_file=$(mktemp)
-            for _ in 1 2; do
+            for attempt in 1 2; do
               if code=$(curl -s -o "$body_file" -w '%{http_code}' \
                          --max-time 15 --connect-timeout 10 \
                          -A "$UA" "$url" 2>/dev/null); then
@@ -141,7 +150,7 @@ jobs:
                   return 0
                   ;;
               esac
-              sleep 3
+              if [ "$attempt" -eq 1 ]; then sleep 3; fi
             done
             rm -f "$body_file"
             if [ "$classification" = "UNREACHABLE" ]; then
@@ -226,6 +235,7 @@ jobs:
       - name: Failure alert
         if: failure()
         shell: bash
+        timeout-minutes: 2
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -277,6 +287,7 @@ jobs:
       - name: Telegram delivery drill
         if: always() && github.event_name == 'workflow_dispatch' && inputs.drill
         shell: bash
+        timeout-minutes: 2
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

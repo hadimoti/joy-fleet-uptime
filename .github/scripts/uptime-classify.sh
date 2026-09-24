@@ -25,14 +25,15 @@ uptime_body_is_challenge() {
 
 uptime_classify() {
   local code="${1:-}" body="${2:-}" curl_exit="${3:-0}"
-  # Only classify a page as challenged when an HTTP response was received.
-  if [ "$curl_exit" -eq 0 ] && [ "$code" != "000" ] && uptime_body_is_challenge "$body"; then
+  # Receiving any HTTP status proves an HTTP response arrived, even if curl
+  # later reports a truncated or timed-out body. Use whatever body was read to
+  # detect challenges, then classify by status. Only HTTP 000 is transport-only.
+  if [[ "$code" =~ ^[0-9]{3}$ ]] && [ "$code" != "000" ] && uptime_body_is_challenge "$body"; then
     echo CHALLENGED
     return
   fi
-  # curl exit failures and HTTP 000 mean no HTTP response was obtained. Keep
-  # these separate so the workflow can check runner connectivity first.
-  if [ "$curl_exit" -ne 0 ] || [ "$code" = "000" ]; then
+  # A non-zero curl exit after receiving a status does not erase that response.
+  if [ "$code" = "000" ]; then
     echo UNREACHABLE
     return
   fi
@@ -46,7 +47,7 @@ uptime_classify() {
 
 uptime_classify_file() {
   local code="${1:-}" file="${2:-}" curl_exit="${3:-0}"
-  if [ -n "$file" ] && [ "$curl_exit" -eq 0 ] && [ "$code" != "000" ] && uptime_file_is_challenge "$file"; then
+  if [ -n "$file" ] && [[ "$code" =~ ^[0-9]{3}$ ]] && [ "$code" != "000" ] && uptime_file_is_challenge "$file"; then
     echo CHALLENGED
   else
     uptime_classify "$code" "" "$curl_exit"

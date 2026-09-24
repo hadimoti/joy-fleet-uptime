@@ -25,11 +25,13 @@ see, since an app can serve a perfectly good homepage while its database is
 unreachable.
 
 Transport failures are tracked separately from HTTP errors. The control check
-is used only when counting timeouts as endpoint failures would change the
-verdict. Confirmed HTTP failures continue to drive the verdict even if the
-control connection fails. Any HTTP response from `api.github.com` proves the
-runner reached the internet, including 403/429; only a curl connection failure
-or HTTP 000 produces `PROBE_NETWORK` when the verdict depends on timeouts.
+is used whenever any target is transport-only. Confirmed HTTP failures continue
+to drive the verdict even if the control connection fails. Any HTTP response
+from `api.github.com` proves the runner reached the internet, including
+403/429; only a curl connection failure or HTTP 000 leaves transport-only
+targets unresolved. `PROBE_NETWORK` is used only when those are the only
+non-UP signals. A challenge mixed with an unresolved transport failure is
+`PROBE_INCONCLUSIVE`, so it cannot make the run green.
 For endpoint probes, any received HTTP status is classified by status even if
 curl later exits non-zero while reading a slow or truncated body. Any challenge
 marker in the portion of the body that was read still takes precedence; an
@@ -38,13 +40,26 @@ HTTP 4xx/5xx responses without a recognized challenge page remain failures.
 Challenge detection uses specific interstitial text and challenge markers, so
 ordinary pages that mention Cloudflare are not treated as blocked.
 
-| Probe evidence | Control response | Verdict handling |
-| :--- | :--- | :--- |
-| Confirmed HTTP failures already establish a non-`OK` verdict with timeouts excluded | Connection failure or HTTP 000 | Keep that confirmed verdict (for example, origin 503 plus CDN 200 plus a CDN timeout remains `ORIGIN_ONLY_DOWN`; a partial CDN failure plus timeout remains `PARTIAL`). |
-| Timeouts could change the verdict | Any HTTP status, including 403/429 | Treat timed-out targets as failures and classify the endpoints. |
-| Only transport failures can produce a non-`OK` verdict (or every CDN is challenged) | Curl connection failure or HTTP 000 | Report `PROBE_NETWORK`; do not infer endpoint failures from those timeouts. |
-| Timeouts could change the verdict | Non-000 HTTP status, even if curl exits non-zero after receiving it | Treat the control host as reached and classify timed-out targets as failures. |
-| Challenge response plus a timeout | Any HTTP status | Ignore the challenge as health evidence; resolve the timeout using the control result. |
+| Origin | `/ready` | CDN hosts | Control failure / HTTP 000 | Any control HTTP status |
+| :--- | :--- | :--- | :--- | :--- |
+| `DOWN` | any | at least one `DOWN` | `ORIGIN_DOWN` | `ORIGIN_DOWN` |
+| `DOWN` | any | no `DOWN` | `ORIGIN_ONLY_DOWN` | `ORIGIN_ONLY_DOWN` |
+| any | `DOWN` | any | `NOT_READY` | `NOT_READY` |
+| `UP` | `UP` | strict majority `DOWN` | `CDN_EDGE` | `CDN_EDGE` |
+| any | any | at least one `DOWN` in other combinations | `PARTIAL` | `PARTIAL` |
+| any | any | only `CHALLENGED`, no transport ambiguity or `UP` evidence | `PROBE_INCONCLUSIVE` | same |
+| any | any | `UP` plus `CHALLENGED`, no transport ambiguity | `CHALLENGED` / `ALL_CHALLENGED` | same |
+| any | any | transport failure, no confirmed `DOWN` or challenge | `PROBE_NETWORK` | Treat unreachable targets as `DOWN` and classify |
+| any | any | transport failure mixed with challenge, no confirmed `DOWN` | `PROBE_INCONCLUSIVE` | Treat unreachable targets as `DOWN` and classify |
+| any | any | transport failure plus confirmed HTTP `DOWN` | Preserve the confirmed verdict | Treat unreachable targets as `DOWN` and classify |
+
+Verdict precedence is `ORIGIN_DOWN`, `ORIGIN_ONLY_DOWN`, `NOT_READY`,
+`CDN_EDGE`, then `PARTIAL`. A readiness failure cannot be described as a
+healthy origin even when most CDN hosts also return failures; the alert includes
+the failing CDN host list for investigation. Challenges are neither `UP` nor
+`DOWN`; without any independent `UP` evidence, they produce a failed,
+inconclusive run. Across retries, any ordinary received 4xx/5xx is retained
+even if a later attempt returns HTTP 000 or succeeds.
 
 ## Why this repository is public
 
@@ -83,9 +98,10 @@ sleep only between attempts. The worst probe path is 12 targets × 33 seconds
 (396 seconds), plus the 10-second control request, 20-second failure alert,
 and optional 20-second delivery drill: 446 seconds total. The probe step has
 an 8-minute limit and the job an 18-minute limit for checkout, checks, and
-runner overhead. The workflow concurrency group lets one run finish before a
-new pending run proceeds, so an alerting run is not cancelled when the
-five-minute schedule fires again.
+runner overhead. Scheduled probes share a concurrency group, so probes remain
+serialized and a running probe is never cancelled. Manual dispatch runs with
+the `drill` option use a separate group so a later scheduled probe cannot
+replace a pending drill.
 
 ## Limitations, stated plainly
 

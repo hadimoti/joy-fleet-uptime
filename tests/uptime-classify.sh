@@ -31,6 +31,18 @@ assert_classification UNREACHABLE 000 0 ''
 assert_classification UP 200 7 'partial body'
 assert_classification UNKNOWN ERR 0 ''
 
+# Retry evidence: a received HTTP failure beats a later transport-only 000.
+assert_retry_failure() {
+  local expected="$1" actual
+  actual=$(uptime_keep_http_failure "${2:-}" "$3" "$4")
+  if [ "$actual" != "$expected" ]; then
+    printf 'Expected retry evidence %s, got %s\n' "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+assert_retry_failure 503 '' 503 DOWN
+assert_retry_failure 503 503 000 UNREACHABLE
+
 assert_verdict() {
   local expected="$1" actual
   shift
@@ -65,6 +77,14 @@ NOT_READY|200|503|7|000|UP|UNREACHABLE|UP
 PROBE_NETWORK|UNREACHABLE|UNREACHABLE|7|000|UNREACHABLE|UNREACHABLE|UNREACHABLE
 ORIGIN_ONLY_DOWN|UNREACHABLE|200|56|403|UP|UP|UP
 ORIGIN_DOWN|503|200|28|000|503|503|UP
+NOT_READY|200|503|0|403|503|503|UP
+CDN_EDGE|200|200|0|403|503|503|UP
+PROBE_INCONCLUSIVE|CHALLENGED|200|7|000|UNREACHABLE|UP|UP
+PROBE_INCONCLUSIVE|200|200|7|000|CHALLENGED|UNREACHABLE|UP
+PARTIAL|CHALLENGED|200|0|403|UNREACHABLE|UP|UP
+ALL_CHALLENGED|200|200|0|403|CHALLENGED|CHALLENGED|CHALLENGED
+PROBE_INCONCLUSIVE|CHALLENGED|CHALLENGED|0|403|CHALLENGED|CHALLENGED|CHALLENGED
+ORIGIN_ONLY_DOWN|503|503|7|000|UP|UP|UP
 VERDICTS
 
 # Exact two-CDN regression: one successful HTTP response and one timeout must

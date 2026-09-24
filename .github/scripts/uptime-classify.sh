@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
 # Shared HTTP response classification for the uptime workflow and offline test.
 
+# Combiner decision table (target states are UP, CHALLENGED, DOWN, UNREACHABLE;
+# DOWN means a received ordinary 4xx/5xx, while challenge pages remain
+# CHALLENGED regardless of their HTTP status. CDN majority uses non-challenged
+# responses; unresolved transport targets are excluded until control is read.
+#
+# For each origin, /ready, and CDN target, apply the following reduction. The
+# word any below covers each of UP, CHALLENGED, DOWN, and UNREACHABLE; CDN rules
+# apply to the host set as a whole. Every target result is retained in its
+# output field (origin_code, ready_code, or down_list):
+# origin | /ready | CDN hosts                          | control       | result
+# -------+-------+------------------------------------+---------------+--------------------
+# DOWN   | any   | >=1 DOWN                           | any           | ORIGIN_DOWN
+# DOWN   | any   | no DOWN                            | any           | ORIGIN_ONLY_DOWN
+# any    | DOWN  | any                                | any           | NOT_READY
+# UP     | UP    | DOWN is strict majority           | any           | CDN_EDGE
+# any    | any   | >=1 DOWN (remaining cases)        | any           | PARTIAL
+# any    | any   | no DOWN/U; all CDN CHALLENGED      | n/a           | ALL_CHALLENGED if any UP
+# C     | any   | no DOWN/U                          | n/a           | CHALLENGED
+# any    | C     | no DOWN/U                          | n/a           | CHALLENGED
+# any    | any   | no DOWN/U; some CDN CHALLENGED     | n/a           | CHALLENGED
+# any    | any   | only C, no U, no positive UP       | n/a           | PROBE_INCONCLUSIVE
+# any    | any   | only UP/C, no U                    | n/a           | OK/CHALLENGED*
+# any    | any   | any U                             | not needed    | NEEDS_CONTROL
+# any    | any   | any U, confirmed DOWN             | connection fail| confirmed result above
+# any    | any   | any U, only UP/C/U                | connection fail| PROBE_INCONCLUSIVE if C, else PROBE_NETWORK
+# any    | any   | any U                             | HTTP response | recompute with each U as DOWN
+# *No challenge is counted as UP or DOWN. A challenge with no independent UP
+#  evidence is PROBE_INCONCLUSIVE; otherwise it is CHALLENGED (or
+#  ALL_CHALLENGED when every CDN host is challenged and origin/ready are UP).
+# A control HTTP response of any status is reachable; curl failure/HTTP 000 is
+# connection failure. Control is otherwise not needed.
+
 uptime_file_is_challenge() {
   local file="$1"
   # These are Cloudflare interstitial fingerprints: challenge internals, its
@@ -54,6 +86,18 @@ uptime_classify_file() {
   fi
 }
 
+# Return the best ordinary HTTP failure observed across retries. The first
+# received 4xx/5xx is durable evidence; a later 000, success, or challenge
+# cannot erase it. Challenge responses are intentionally not ordinary DOWN.
+uptime_keep_http_failure() {
+  local previous="${1:-}" current="${2:-}" classification="${3:-}"
+  if [[ "$previous" =~ ^[45][0-9][0-9]$ ]]; then
+    echo "$previous"
+  elif [ "$classification" = DOWN ] && [[ "$current" =~ ^[45][0-9][0-9]$ ]]; then
+    echo "$current"
+  fi
+}
+
 # Produce the fleet verdict for one interpretation of transport-ambiguous
 # targets. "exclude" preserves only confirmed HTTP evidence; "down" treats
 # UNREACHABLE targets as endpoint failures (after the control host reached HTTP).
@@ -95,14 +139,14 @@ uptime_verdict_for() {
 
   if [ "$origin_failed" -eq 1 ] && [ "$n_down" -gt 0 ]; then
     echo ORIGIN_DOWN
-  elif [ "$origin_ok" -eq 1 ] && [ "$n_down" -gt 0 ] && [ "$n_answered" -gt 0 ] && [ "$n_down" -gt $((n_answered / 2)) ]; then
-    echo CDN_EDGE
-  elif [ "$n_down" -gt 0 ]; then
-    echo PARTIAL
   elif [ "$origin_failed" -eq 1 ]; then
     echo ORIGIN_ONLY_DOWN
   elif [ "$ready_failed" -eq 1 ]; then
     echo NOT_READY
+  elif [ "$origin_ok" -eq 1 ] && [ "$ready_ok" -eq 1 ] && [ "$n_down" -gt 0 ] && [ "$n_answered" -gt 0 ] && [ "$n_down" -gt $((n_answered / 2)) ]; then
+    echo CDN_EDGE
+  elif [ "$n_down" -gt 0 ]; then
+    echo PARTIAL
   elif [ "$n_chal" -eq "$n_total" ] && [ "$n_total" -gt 0 ]; then
     echo ALL_CHALLENGED
   elif [ "$origin_challenged" -eq 1 ] || [ "$ready_challenged" -eq 1 ]; then
@@ -121,28 +165,49 @@ uptime_verdict() {
   local origin_code="$1" ready_code="$2" control_exit="$3" control_code="$4"
   shift 4
   local -a cdn_codes=("$@")
-  local confirmed_verdict resolved_verdict
+  local confirmed_verdict resolved_verdict has_unreachable=0 has_challenge=0 has_up=0 code
 
   confirmed_verdict=$(uptime_verdict_for exclude "$origin_code" "$ready_code" "${cdn_codes[@]}")
   resolved_verdict=$(uptime_verdict_for down "$origin_code" "$ready_code" "${cdn_codes[@]}")
+
+  for code in "$origin_code" "$ready_code" "${cdn_codes[@]}"; do
+    [ "$code" = UNREACHABLE ] && has_unreachable=1
+    [ "$code" = CHALLENGED ] && has_challenge=1
+    [[ "$code" =~ ^[23][0-9][0-9]$ ]] && has_up=1
+  done
+
+  # A transport-only target always requires the control check: it cannot be
+  # treated as success just because the remaining evidence is challenged.
+  if [ "$has_unreachable" -eq 1 ]; then
+    if [ "$control_exit" = -1 ]; then
+      echo NEEDS_CONTROL
+    elif [ "$control_code" = 000 ] || [ -z "$control_code" ]; then
+      if [ "$confirmed_verdict" != OK ] && [ "$confirmed_verdict" != ALL_CHALLENGED ] && [ "$confirmed_verdict" != CHALLENGED ]; then
+        echo "$confirmed_verdict"
+      elif [ "$has_challenge" -eq 1 ]; then
+        echo PROBE_INCONCLUSIVE
+      else
+        echo PROBE_NETWORK
+      fi
+    else
+      echo "$resolved_verdict"
+    fi
+    return
+  fi
+
+  # Challenges do not provide positive health evidence. With no UP target,
+  # the result is an inconclusive failed run rather than a green challenge.
+  if [ "$has_challenge" -eq 1 ] && [ "$has_up" -eq 0 ] && \
+     { [ "$confirmed_verdict" = OK ] || [ "$confirmed_verdict" = ALL_CHALLENGED ] || [ "$confirmed_verdict" = CHALLENGED ]; }; then
+    echo PROBE_INCONCLUSIVE
+    return
+  fi
 
   # If resolving timeouts cannot change the outcome, confirmed HTTP evidence
   # already determines the verdict and a failing control host is irrelevant.
   if [ "$confirmed_verdict" = "$resolved_verdict" ]; then
     echo "$confirmed_verdict"
-  elif [ "$control_exit" = -1 ]; then
-    echo NEEDS_CONTROL
-  elif [ "$control_code" = 000 ] || [ -z "$control_code" ]; then
-    # On control failure, keep any verdict already supported by HTTP evidence.
-    # PROBE_NETWORK is only justified when transport-ambiguous targets are the
-    # sole reason the down interpretation differs from confirmed evidence.
-    if [ "$confirmed_verdict" != OK ] && [ "$confirmed_verdict" != ALL_CHALLENGED ]; then
-      echo "$confirmed_verdict"
-    else
-      echo PROBE_NETWORK
-    fi
   else
-    # Any HTTP response (including 403/429) confirms the runner reached out.
-    echo "$resolved_verdict"
+    echo "$confirmed_verdict"
   fi
 }

@@ -63,7 +63,7 @@ permissions:
 concurrency:
   # Do not cancel a running probe or its alert. GitHub keeps at most one pending
   # run in this group, replacing older pending runs if schedule triggers pile up.
-  group: uptime
+  group: uptime-${{ github.event_name == 'workflow_dispatch' && inputs.drill && 'drill' || 'probe' }}
   cancel-in-progress: false
 
 jobs:
@@ -127,7 +127,7 @@ jobs:
           # Two attempts before calling anything down, so a single transient
           # DNS or TLS blip on a shared runner never wakes anyone up.
           probe() {
-            local url=$1 code body_file classification curl_exit attempt
+            local url=$1 code body_file classification curl_exit attempt best_down= challenge_seen=0
             body_file=$(mktemp)
             for attempt in 1 2; do
               if code=$(curl -s -o "$body_file" -w '%{http_code}' \
@@ -140,20 +140,29 @@ jobs:
               classification=$(uptime_classify_file "$code" "$body_file" "$curl_exit")
               case "$classification" in
                 UP)
-                  rm -f "$body_file"
-                  echo "$code"
-                  return 0
+                  if [ -z "$best_down" ]; then
+                    rm -f "$body_file"
+                    echo "$code"
+                    return 0
+                  fi
                   ;;
                 CHALLENGED)
-                  rm -f "$body_file"
-                  echo "CHALLENGED"
-                  return 0
+                  challenge_seen=1
+                  ;;
+                DOWN)
+                  # Preserve any received HTTP failure across attempts. A
+                  # later HTTP 000 (or success/challenge) cannot erase it.
+                  best_down=$(uptime_keep_http_failure "$best_down" "$code" "$classification")
                   ;;
               esac
               if [ "$attempt" -eq 1 ]; then sleep 3; fi
             done
             rm -f "$body_file"
-            if [ "$classification" = "UNREACHABLE" ]; then
+            if [ -n "$best_down" ]; then
+              echo "$best_down"
+            elif [ "$challenge_seen" -eq 1 ] && [ "$classification" != "UP" ]; then
+              echo CHALLENGED
+            elif [ "$classification" = "UNREACHABLE" ]; then
               echo UNREACHABLE
             else
               echo "${code:-000}"
@@ -268,7 +277,10 @@ jobs:
               advice="The direct origin path is down while proxied hosts serve." ;;
             NOT_READY)
               headline="App reports NOT READY"
-              advice="The edge serves but /ready reports a failed dependency. Check the app's upstreams." ;;
+              advice="/ready reports a failed dependency. Check the app and review every listed failing host, including CDN paths." ;;
+            PROBE_INCONCLUSIVE)
+              headline="Probe inconclusive"
+              advice="The probes produced no positive health evidence, or challenges coincided with connection failures. The health check is not green; inspect the probe paths." ;;
             *)
               headline="Probe failed ($VERDICT)"
               advice="See the workflow run." ;;
@@ -277,12 +289,21 @@ jobs:
           text=$(printf '%s\n\ndown: %s\nready: %s\norigin: %s\n\n%s\n\n%s' \
             "$headline" "$DOWN_LIST" "$READY_CODE" "$ORIGIN_CODE" "$advice" "$RUN_URL")
 
-          status=$(curl -s -o "$response_file" -w '%{http_code}' --max-time 20 \
+          if status=$(curl -s -o "$response_file" -w '%{http_code}' --max-time 20 \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" \
             --data-urlencode "disable_web_page_preview=true" \
-            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null || true)
-          printf 'Telegram HTTP status: %s\n' "${status:-000}"
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null); then
+            curl_exit=0
+          else
+            curl_exit=$?
+          fi
+          ok=$(jq -r 'if .ok == true then "true" else "false" end' "$response_file" 2>/dev/null || echo false)
+          printf 'Telegram HTTP status: %s; ok: %s\n' "${status:-000}" "$ok"
+          if [ "$curl_exit" -ne 0 ] || [ "${status:-000}" != "200" ] || [ "$ok" != "true" ]; then
+            echo "::error::Telegram alert delivery was not confirmed"
+            exit 1
+          fi
 
       - name: Telegram delivery drill
         if: always() && github.event_name == 'workflow_dispatch' && inputs.drill

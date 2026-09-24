@@ -53,6 +53,25 @@ assert_verdict() {
   fi
 }
 
+assert_alert_decision() {
+  local verdict="$1" expected="$2" actual=alert
+  if uptime_should_alert "$verdict"; then actual=alert; else actual=no-alert; fi
+  if [ "$actual" != "$expected" ]; then
+    printf 'Expected %s for verdict %s, got %s\n' "$expected" "$verdict" "$actual" >&2
+    exit 1
+  fi
+}
+
+# Only successful health/challenge verdicts suppress alerts. Every failure
+# verdict and crash fallback routes to Telegram.
+for verdict in OK CHALLENGED ALL_CHALLENGED; do
+  assert_alert_decision "$verdict" no-alert
+done
+for verdict in ORIGIN_DOWN ORIGIN_ONLY_DOWN NOT_READY CDN_EDGE PARTIAL \
+  PROBE_INCONCLUSIVE PROBE_NETWORK PROBE_CRASH NEEDS_CONTROL UNKNOWN; do
+  assert_alert_decision "$verdict" alert
+done
+
 # Verdict table: expected, origin, /ready, control curl exit, control HTTP,
 # then one result for each CDN. A control exit of -1 asks whether control is
 # needed; the classifier returns NEEDS_CONTROL only when timeouts can change
@@ -85,6 +104,7 @@ PROBE_INCONCLUSIVE|200|200|7|000|CHALLENGED|UNREACHABLE|UP
 PARTIAL|CHALLENGED|200|0|403|UNREACHABLE|UP|UP
 ALL_CHALLENGED|200|200|0|403|CHALLENGED|CHALLENGED|CHALLENGED
 PROBE_INCONCLUSIVE|CHALLENGED|CHALLENGED|0|403|CHALLENGED|CHALLENGED|CHALLENGED
+CHALLENGED|CHALLENGED|200|0|403|CHALLENGED|CHALLENGED|CHALLENGED
 ORIGIN_ONLY_DOWN|503|503|7|000|UP|UP|UP
 VERDICTS
 

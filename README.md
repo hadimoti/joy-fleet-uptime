@@ -48,6 +48,7 @@ ordinary pages that mention Cloudflare are not treated as blocked.
 | `UP` | `UP` | strict majority `DOWN` | `CDN_EDGE` | `CDN_EDGE` |
 | any | any | at least one `DOWN` in other combinations | `PARTIAL` | `PARTIAL` |
 | any | any | only `CHALLENGED`, no transport ambiguity or `UP` evidence | `PROBE_INCONCLUSIVE` | same |
+| `UP` | `UP` | all CDN hosts `CHALLENGED`, no transport ambiguity | `ALL_CHALLENGED` | same |
 | any | any | `UP` plus `CHALLENGED`, no transport ambiguity | `CHALLENGED` / `ALL_CHALLENGED` | same |
 | any | any | transport failure, no confirmed `DOWN` or challenge | `PROBE_NETWORK` | Treat unreachable targets as `DOWN` and classify |
 | any | any | transport failure mixed with challenge, no confirmed `DOWN` | `PROBE_INCONCLUSIVE` | Treat unreachable targets as `DOWN` and classify |
@@ -58,8 +59,10 @@ Verdict precedence is `ORIGIN_DOWN`, `ORIGIN_ONLY_DOWN`, `NOT_READY`,
 healthy origin even when most CDN hosts also return failures; the alert includes
 the failing CDN host list for investigation. Challenges are neither `UP` nor
 `DOWN`; without any independent `UP` evidence, they produce a failed,
-inconclusive run. A `CHALLENGED` verdict fails the probe step and invokes the
-generic failure alert; `ALL_CHALLENGED` exits successfully without an alert.
+inconclusive run. `CHALLENGED` and `ALL_CHALLENGED` exit successfully without a
+Telegram alert; the challenged host list appears in a GitHub warning and job
+summary. `PROBE_INCONCLUSIVE` still fails and alerts when there is no positive
+health evidence.
 Across retries, any ordinary received 4xx/5xx is retained
 even if a later attempt returns HTTP 000 or succeeds.
 
@@ -88,8 +91,8 @@ workflows triggered by pull requests from forks, so a fork cannot read them.
 3. Run it once by hand: **Actions → uptime → Run workflow**.
    The optional `drill` checkbox sends one `[DRILL]` Telegram delivery test
    with the run link and UTC timestamp. The `[DRILL]` message itself never
-   uses outage wording. If a probe also finds a real failure, its separate
-   failure alert may accompany the drill and use outage wording. The drill is
+   uses outage wording. If the probe step fails, a separate status alert may
+   accompany the drill. The drill is
    successful only when Telegram returns
    HTTP 200 and confirms `ok: true`; missing secrets or an unconfirmed response
    fail the drill step. Scheduled runs cannot send a drill.

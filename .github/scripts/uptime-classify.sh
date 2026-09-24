@@ -17,7 +17,7 @@
 # any    | DOWN  | any                                | any           | NOT_READY
 # UP     | UP    | DOWN is strict majority           | any           | CDN_EDGE
 # any    | any   | >=1 DOWN (remaining cases)        | any           | PARTIAL
-# any    | any   | no DOWN/U; all CDN CHALLENGED      | n/a           | ALL_CHALLENGED if any UP
+# any    | any   | no DOWN/U; all CDN CHALLENGED      | n/a           | ALL_CHALLENGED only if origin and /ready are UP
 # C     | any   | no DOWN/U                          | n/a           | CHALLENGED
 # any    | C     | no DOWN/U                          | n/a           | CHALLENGED
 # any    | any   | no DOWN/U; any CDN CHALLENGED      | n/a           | CHALLENGED
@@ -30,8 +30,9 @@
 # A challenge is never UP/OK and never DOWN. Without independent UP evidence,
 #  it is PROBE_INCONCLUSIVE; otherwise it is CHALLENGED (or ALL_CHALLENGED
 #  when every CDN host is challenged and origin/ready are UP).
-# Workflow handling: CHALLENGED fails the probe step and invokes the generic
-#  failure alert; ALL_CHALLENGED succeeds without an alert, matching origin/main.
+# Workflow handling: OK, CHALLENGED, and ALL_CHALLENGED succeed without a
+#  Telegram alert. Challenges stay visible in a warning annotation and summary.
+#  All failure verdicts, including inconclusive/network/crash, alert.
 # A control HTTP response of any status is reachable; curl failure/HTTP 000 is
 # connection failure. Control is otherwise not needed.
 
@@ -113,6 +114,15 @@ uptime_record_cdn_result() {
   esac
 }
 
+# Only confirmed health or challenge outcomes suppress Telegram. The workflow
+# uses this function's result so alert routing stays covered by the contract.
+uptime_should_alert() {
+  case "${1:-PROBE_CRASH}" in
+    OK|CHALLENGED|ALL_CHALLENGED) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # Produce the fleet verdict for one interpretation of transport-ambiguous
 # targets. "exclude" preserves only confirmed HTTP evidence; "down" treats
 # UNREACHABLE targets as endpoint failures (after the control host reached HTTP).
@@ -162,7 +172,8 @@ uptime_verdict_for() {
     echo CDN_EDGE
   elif [ "$n_down" -gt 0 ]; then
     echo PARTIAL
-  elif [ "$n_chal" -eq "$n_total" ] && [ "$n_total" -gt 0 ]; then
+  elif [ "$n_chal" -eq "$n_total" ] && [ "$n_total" -gt 0 ] && \
+       [ "$origin_ok" -eq 1 ] && [ "$ready_ok" -eq 1 ]; then
     echo ALL_CHALLENGED
   elif [ "$origin_challenged" -eq 1 ] || [ "$ready_challenged" -eq 1 ]; then
     echo CHALLENGED

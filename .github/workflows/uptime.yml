@@ -25,9 +25,9 @@
 # the monitor is simply not allowed to look.
 #
 # Treating that as DOWN would misreport the host's state. A challenge is
-# classified separately and never counted as UP or DOWN. The CHALLENGED verdict
-# still fails the probe step and uses the generic failure alert; ALL_CHALLENGED
-# succeeds quietly as a configuration gap. To make those hosts genuinely
+# classified separately and never counted as UP or DOWN. Both CHALLENGED and
+# ALL_CHALLENGED are successful inconclusive probe outcomes; they emit a GitHub
+# warning and summary entry, without paging. To make those hosts genuinely
 # measurable, add a CDN rule that skips bot protection for the monitored paths
 # (/ready, /live).
 #
@@ -231,20 +231,38 @@ jobs:
             echo "down_list=${down[*]:-none}"
             echo "challenged_list=${challenged[*]:-none}"
             echo "unreachable_list=${unreachable[*]:-none}"
+            if uptime_should_alert "$verdict"; then
+              echo "alert_required=true"
+            else
+              echo "alert_required=false"
+            fi
           } >> "$GITHUB_OUTPUT"
 
           echo "VERDICT: $verdict"
 
-          # ALL_CHALLENGED is a configuration gap, not an incident. It is
-          # visible in the log without failing the job or waking anyone.
-          # CHALLENGED follows origin/main: fail and use the generic alert.
+          if [ "$verdict" = CHALLENGED ] || [ "$verdict" = ALL_CHALLENGED ]; then
+            challenge_targets=("${challenged[@]}")
+            [ "$origin_code" = CHALLENGED ] && challenge_targets+=("$ORIGIN_HOST")
+            [ "$ready_code" = CHALLENGED ] && challenge_targets+=("direct.joyteam.ir/ready")
+            challenge_targets_text=${challenge_targets[*]:-none}
+            echo "::warning::CDN bot challenge; probe is inconclusive and will not page. Challenged hosts: $challenge_targets_text"
+            {
+              echo "### CDN challenge (inconclusive; no Telegram alert)"
+              echo "Challenged hosts: $challenge_targets_text"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Challenges remain a distinct, non-paging outcome. Inconclusive
+          # results without positive health evidence still fail and alert.
           case "$verdict" in
-            OK|ALL_CHALLENGED) exit 0 ;;
+            OK|CHALLENGED|ALL_CHALLENGED) exit 0 ;;
             *) exit 1 ;;
           esac
 
       - name: Failure alert
-        if: failure()
+        # A missing output means the probe crashed before deciding, so retain
+        # the PROBE_CRASH alert fallback. The tested classifier decides known verdicts.
+        if: always() && steps.probe.outputs.alert_required != 'false'
         shell: bash
         timeout-minutes: 2
         env:

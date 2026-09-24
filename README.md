@@ -24,6 +24,14 @@ application's own dependencies are healthy — something a homepage check cannot
 see, since an app can serve a perfectly good homepage while its database is
 unreachable.
 
+Transport failures are tracked separately from HTTP errors. If a probe cannot
+connect, the workflow checks `api.github.com` with bounded timeouts; if that
+control request also fails, the run reports `PROBE_NETWORK` and does not infer
+a fleet outage from the runner's connectivity problem. HTTP 4xx/5xx responses
+without a recognized challenge page remain failures. Challenge detection uses
+specific interstitial text and challenge markers, so ordinary pages that
+mention Cloudflare are not treated as blocked.
+
 ## Why this repository is public
 
 GitHub Actions is free and unmetered on public repositories but metered on
@@ -49,11 +57,13 @@ workflows triggered by pull requests from forks, so a fork cannot read them.
 3. Run it once by hand: **Actions → uptime → Run workflow**.
    The optional `drill` checkbox sends one `[DRILL]` Telegram delivery test
    with the run link and UTC timestamp. It still runs the probes and never
-   uses outage wording.
+   uses outage wording. The drill is successful only when Telegram returns
+   HTTP 200 and confirms `ok: true`; missing secrets or an unconfirmed response
+   fail the drill step. Scheduled runs cannot send a drill.
 
-Challenge response markers are checked on every HTTP status. A marked response
-is reported as challenged and is not counted as healthy or down. The workflow
-runs the offline classification contract before probing.
+Recognized challenge response markers are checked on every HTTP status. A
+marked response is reported as challenged and is not counted as healthy or
+down. The workflow runs the offline classification contract before probing.
 
 ## Limitations, stated plainly
 

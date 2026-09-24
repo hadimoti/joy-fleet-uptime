@@ -112,18 +112,23 @@ jobs:
 
           UA='uptime-probe/1.0'
 
-          # Echoes a successful HTTP code, CHALLENGED, or the last failed code.
+          # Echoes a successful HTTP code, CHALLENGED, a failed HTTP code, or
+          # UNREACHABLE when curl did not receive an HTTP response.
           #
           # Two attempts before calling anything down, so a single transient
           # DNS or TLS blip on a shared runner never wakes anyone up.
           probe() {
-            local url=$1 code body_file classification
+            local url=$1 code body_file classification curl_exit
             body_file=$(mktemp)
             for _ in 1 2; do
-              code=$(curl -s -o "$body_file" -w '%{http_code}' \
-                       --max-time 15 --connect-timeout 10 \
-                       -A "$UA" "$url" 2>/dev/null) || true
-              classification=$(uptime_classify_file "$code" "$body_file")
+              if code=$(curl -s -o "$body_file" -w '%{http_code}' \
+                         --max-time 15 --connect-timeout 10 \
+                         -A "$UA" "$url" 2>/dev/null); then
+                curl_exit=0
+              else
+                curl_exit=$?
+              fi
+              classification=$(uptime_classify_file "$code" "$body_file" "$curl_exit")
               case "$classification" in
                 UP)
                   rm -f "$body_file"
@@ -139,25 +144,41 @@ jobs:
               sleep 3
             done
             rm -f "$body_file"
-            echo "${code:-000}"
+            if [ "$classification" = "UNREACHABLE" ]; then
+              echo UNREACHABLE
+            else
+              echo "${code:-000}"
+            fi
             return 1
           }
 
           down=()
           challenged=()
+          unreachable_count=0
           for h in "${CDN_HOSTS[@]}"; do
-            code=$(probe "https://${h}/") || down+=("${h}(${code})")
+            code=$(probe "https://${h}/") || {
+              down+=("${h}(${code})")
+              if [ "$code" = "UNREACHABLE" ]; then
+                unreachable_count=$((unreachable_count + 1))
+              fi
+            }
             if [ "$code" = "CHALLENGED" ]; then challenged+=("$h"); fi
             printf '%-24s %s\n' "$h" "$code"
           done
 
           origin_code=$(probe "https://${ORIGIN_HOST}/") || true
+          if [ "$origin_code" = "UNREACHABLE" ]; then
+            unreachable_count=$((unreachable_count + 1))
+          fi
           printf '%-24s %s\n' "$ORIGIN_HOST" "$origin_code"
 
           # The readiness endpoint reports whether the app's own dependencies
           # are healthy, which a plain homepage check cannot see: an app can
           # serve a perfectly good homepage while its database is unreachable.
           ready_code=$(probe "$READY_URL") || true
+          if [ "$ready_code" = "UNREACHABLE" ]; then
+            unreachable_count=$((unreachable_count + 1))
+          fi
           printf '%-24s %s\n' 'ready' "$ready_code"
 
           origin_ok=0
@@ -187,7 +208,19 @@ jobs:
             echo ""
           fi
 
-          if [ "$origin_ok" -eq 0 ] && [ "$origin_challenged" -eq 0 ] && [ "$n_down" -gt 0 ]; then
+          control_ok=1
+          if [ "$unreachable_count" -gt 0 ]; then
+            # A runner-wide network/TLS outage must not become a fleet outage.
+            # This independent public control endpoint uses bounded timeouts.
+            if ! curl -fsS -o /dev/null --max-time 10 --connect-timeout 5 \
+                    https://api.github.com/ 2>/dev/null; then
+              control_ok=0
+            fi
+          fi
+
+          if [ "$control_ok" -eq 0 ]; then
+            verdict="PROBE_NETWORK"
+          elif [ "$origin_ok" -eq 0 ] && [ "$origin_challenged" -eq 0 ] && [ "$n_down" -gt 0 ]; then
             # Origin unreachable AND at least one host genuinely failing is the
             # only combination that justifies calling this a real outage.
             verdict="ORIGIN_DOWN"
@@ -224,8 +257,8 @@ jobs:
             *) exit 1 ;;
           esac
 
-      - name: Alert
-        if: always() && ((github.event_name == 'workflow_dispatch' && inputs.drill) || failure())
+      - name: Failure alert
+        if: failure()
         shell: bash
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -235,26 +268,12 @@ jobs:
           READY_CODE: ${{ steps.probe.outputs.ready_code }}
           ORIGIN_CODE: ${{ steps.probe.outputs.origin_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          DRILL: ${{ github.event_name == 'workflow_dispatch' && inputs.drill || false }}
         run: |
           set -uo pipefail
           response_file=$(mktemp)
           trap 'rm -f "$response_file"' EXIT
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
             echo "::warning::Telegram secrets not set; alert not delivered"
-            exit 0
-          fi
-
-          if [ "$DRILL" = "true" ]; then
-            timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-            text=$(printf '[DRILL] Telegram delivery test\n\nThis is a test message.\nTimestamp: %s\nRun: %s' \
-              "$timestamp" "$RUN_URL")
-            status=$(curl -s -o "$response_file" -w '%{http_code}' --max-time 20 \
-              --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "text=${text}" \
-              --data-urlencode "disable_web_page_preview=true" \
-              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null || true)
-            printf 'Telegram HTTP status: %s\n' "${status:-000}"
             exit 0
           fi
 
@@ -288,3 +307,39 @@ jobs:
             --data-urlencode "disable_web_page_preview=true" \
             "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null || true)
           printf 'Telegram HTTP status: %s\n' "${status:-000}"
+
+      - name: Telegram delivery drill
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.drill
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "::error::Telegram delivery drill failed (required secrets are missing)"
+            exit 1
+          fi
+
+          timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          text=$(printf '[DRILL] Telegram delivery test\n\nThis is a test message.\nTimestamp: %s\nRun: %s' \
+            "$timestamp" "$RUN_URL")
+          if status=$(curl -s -o "$response_file" -w '%{http_code}' \
+              --max-time 20 --connect-timeout 10 \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${text}" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null); then
+            curl_exit=0
+          else
+            curl_exit=$?
+          fi
+          ok=$(jq -r 'if .ok == true then "true" else "false" end' "$response_file" 2>/dev/null || echo false)
+          printf 'Telegram HTTP status: %s; ok: %s\n' "${status:-000}" "$ok"
+          if [ "$curl_exit" -ne 0 ] || [ "${status:-000}" != "200" ] || [ "$ok" != "true" ]; then
+            echo "::error::Telegram delivery drill was not confirmed"
+            exit 1
+          fi

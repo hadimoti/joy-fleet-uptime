@@ -63,8 +63,11 @@ inconclusive run. `CHALLENGED` and `ALL_CHALLENGED` exit successfully without a
 Telegram alert; the challenged host list appears in a GitHub warning and job
 summary. `PROBE_INCONCLUSIVE` still fails and alerts when there is no positive
 health evidence.
-Across retries, any ordinary received 4xx/5xx is retained
-even if a later attempt returns HTTP 000 or succeeds.
+Across at most two attempts per target, any `UP` result wins and stops retries;
+otherwise a received ordinary 4xx/5xx (`DOWN`) wins, then any invalid status or
+HTTP 000 (`UNREACHABLE`), and finally all-challenge attempts produce
+`CHALLENGED`. A later success clears an earlier failure, while a confirmed HTTP
+failure is retained over a later timeout or challenge.
 
 ## Why this repository is public
 

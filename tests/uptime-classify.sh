@@ -29,19 +29,28 @@ assert_classification DOWN 503 28 'slow unavailable response'
 assert_classification UP 200 28 ''
 assert_classification UNREACHABLE 000 0 ''
 assert_classification UP 200 7 'partial body'
-assert_classification UNKNOWN ERR 0 ''
+assert_classification UNREACHABLE ERR 0 ''
+assert_classification UNREACHABLE '' 0 ''
+assert_classification UNREACHABLE garbage 0 ''
+assert_classification UNREACHABLE 20 0 ''
 
-# Retry evidence: a received HTTP failure beats a later transport-only 000.
-assert_retry_failure() {
+# Per-target reduction table; UP clears earlier failures, then DOWN, then
+# UNREACHABLE, with CHALLENGED only when every attempt was challenged.
+assert_target_result() {
   local expected="$1" actual
-  actual=$(uptime_keep_http_failure "${2:-}" "$3" "$4")
+  shift
+  actual=$(uptime_reduce_attempts "$@")
   if [ "$actual" != "$expected" ]; then
-    printf 'Expected retry evidence %s, got %s\n' "$expected" "$actual" >&2
+    printf 'Expected target result %s for attempts %s, got %s\n' "$expected" "$*" "$actual" >&2
     exit 1
   fi
 }
-assert_retry_failure 503 '' 503 DOWN
-assert_retry_failure 503 503 000 UNREACHABLE
+assert_target_result UP DOWN UP
+assert_target_result DOWN DOWN UNREACHABLE
+assert_target_result UNREACHABLE CHALLENGED UNREACHABLE
+assert_target_result UNREACHABLE UNREACHABLE CHALLENGED
+assert_target_result CHALLENGED CHALLENGED CHALLENGED
+assert_target_result UNREACHABLE UNREACHABLE
 
 assert_verdict() {
   local expected="$1" actual
@@ -122,6 +131,20 @@ assert_verdict ORIGIN_ONLY_DOWN UNREACHABLE 200 56 403 UP UP
 assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 0 403 UNREACHABLE
 assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 0 429 UNREACHABLE
 
+# Twelve transport-only targets must never collapse to OK: an unreachable
+# control means PROBE_NETWORK; an HTTP response resolves them as failures.
+assert_verdict PROBE_NETWORK UNREACHABLE UNREACHABLE 7 000 \
+  UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE \
+  UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE
+assert_verdict ORIGIN_DOWN UNREACHABLE UNREACHABLE 7 403 \
+  UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE \
+  UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE UNREACHABLE
+
+# /ready challenge followed by HTTP 000 reduces to UNREACHABLE and cannot be
+# green after the reachable control resolves that transport ambiguity.
+assert_target_result UNREACHABLE CHALLENGED UNREACHABLE
+assert_verdict NOT_READY 200 UNREACHABLE 7 403 UP UP UP
+
 # A challenge is neutral evidence. It cannot turn the remaining timeout into
 # an origin outage; with a reachable control, that timeout is only PARTIAL.
 assert_verdict PARTIAL 200 200 0 403 CHALLENGED UNREACHABLE UP
@@ -186,8 +209,8 @@ if [ "$(uptime_classify_file 503 "$file" 28)" != CHALLENGED ]; then
   printf 'Expected a received status and partial challenge body to remain CHALLENGED after curl error\n' >&2
   exit 1
 fi
-if [ "$(uptime_classify_file 000 "$file" 28)" != UNREACHABLE ]; then
-  printf 'Expected curl transport failure to be UNREACHABLE\n' >&2
+if [ "$(uptime_classify_file 000 "$file" 28)" != CHALLENGED ]; then
+  printf 'Expected a challenge marker to classify as CHALLENGED at any status\n' >&2
   exit 1
 fi
 

@@ -60,44 +60,57 @@ uptime_body_is_challenge() {
 
 uptime_classify() {
   local code="${1:-}" body="${2:-}" curl_exit="${3:-0}"
-  # Receiving any HTTP status proves an HTTP response arrived, even if curl
-  # later reports a truncated or timed-out body. Use whatever body was read to
-  # detect challenges, then classify by status. Only HTTP 000 is transport-only.
-  if [[ "$code" =~ ^[0-9]{3}$ ]] && [ "$code" != "000" ] && uptime_body_is_challenge "$body"; then
+  # A recognized challenge marker wins for any returned status.
+  if uptime_body_is_challenge "$body"; then
     echo CHALLENGED
     return
   fi
-  # A non-zero curl exit after receiving a status does not erase that response.
-  if [ "$code" = "000" ]; then
+  # A missing or malformed curl status is transport ambiguity. Normalize it
+  # here so it cannot disappear from the fleet verdict as an unknown value.
+  if ! [[ "$code" =~ ^[0-9]{3}$ ]] || [ "$code" = "000" ]; then
     echo UNREACHABLE
     return
   fi
+  # Receiving any HTTP status proves an HTTP response arrived, even if curl
+  # later reports a truncated or timed-out body. Use whatever body was read to
+  # detect challenges, then classify by status.
+  # A non-zero curl exit after receiving a status does not erase that response.
   case "$code" in
     2*|3*) echo UP ;;
     4*|5*) echo DOWN ;;
-    ERR|'') echo UNKNOWN ;;
-    *) echo UNKNOWN ;;
+    *) echo UNREACHABLE ;;
   esac
 }
 
 uptime_classify_file() {
   local code="${1:-}" file="${2:-}" curl_exit="${3:-0}"
-  if [ -n "$file" ] && [[ "$code" =~ ^[0-9]{3}$ ]] && [ "$code" != "000" ] && uptime_file_is_challenge "$file"; then
+  if [ -n "$file" ] && uptime_file_is_challenge "$file"; then
     echo CHALLENGED
   else
     uptime_classify "$code" "" "$curl_exit"
   fi
 }
 
-# Return the best ordinary HTTP failure observed across retries. The first
-# received 4xx/5xx is durable evidence; a later 000, success, or challenge
-# cannot erase it. Challenge responses are intentionally not ordinary DOWN.
-uptime_keep_http_failure() {
-  local previous="${1:-}" current="${2:-}" classification="${3:-}"
-  if [[ "$previous" =~ ^[45][0-9][0-9]$ ]]; then
-    echo "$previous"
-  elif [ "$classification" = DOWN ] && [[ "$current" =~ ^[45][0-9][0-9]$ ]]; then
-    echo "$current"
+# Reduce the classified attempts for one target. UP is conclusive and wins;
+# otherwise a received HTTP failure wins, then transport ambiguity, then
+# challenge. Unknown inputs are treated as UNREACHABLE so no attempt is lost.
+uptime_reduce_attempts() {
+  local state has_down=0 has_unreachable=0
+  for state in "$@"; do
+    case "$state" in
+      UP) echo UP; return ;;
+      DOWN) has_down=1 ;;
+      UNREACHABLE) has_unreachable=1 ;;
+      CHALLENGED) ;;
+      *) has_unreachable=1 ;;
+    esac
+  done
+  if [ "$has_down" -eq 1 ]; then
+    echo DOWN
+  elif [ "$has_unreachable" -eq 1 ]; then
+    echo UNREACHABLE
+  else
+    echo CHALLENGED
   fi
 }
 

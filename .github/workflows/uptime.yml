@@ -121,14 +121,14 @@ jobs:
 
           UA='uptime-probe/1.0'
 
-          # Echoes a successful HTTP code, CHALLENGED, a failed HTTP code, or
-          # UNREACHABLE only when curl received HTTP 000. If curl received a
-          # status before a body transfer error, classify by that status.
-          #
-          # Two attempts before calling anything down, so a single transient
-          # DNS or TLS blip on a shared runner never wakes anyone up.
+          # Each attempt is UP (2xx/3xx without a challenge marker), CHALLENGED,
+          # DOWN (unmarked 4xx/5xx), or UNREACHABLE (000 or invalid status).
+          # Across at most two attempts, reduce in this order: any UP -> UP;
+          # else any DOWN -> DOWN; else any UNREACHABLE -> UNREACHABLE; else
+          # CHALLENGED. Stop immediately on UP.
           probe() {
-            local url=$1 code body_file classification curl_exit attempt best_down= challenge_seen=0
+            local url=$1 code body_file classification curl_exit attempt result i
+            local -a attempt_states=() attempt_codes=()
             body_file=$(mktemp)
             for attempt in 1 2; do
               if code=$(curl -s -o "$body_file" -w '%{http_code}' \
@@ -139,36 +139,22 @@ jobs:
                 curl_exit=$?
               fi
               classification=$(uptime_classify_file "$code" "$body_file" "$curl_exit")
-              case "$classification" in
-                UP)
-                  if [ -z "$best_down" ]; then
-                    rm -f "$body_file"
-                    echo "$code"
-                    return 0
-                  fi
-                  ;;
-                CHALLENGED)
-                  challenge_seen=1
-                  ;;
-                DOWN)
-                  # Preserve any received HTTP failure across attempts. A
-                  # later HTTP 000 (or success/challenge) cannot erase it.
-                  best_down=$(uptime_keep_http_failure "$best_down" "$code" "$classification")
-                  ;;
-              esac
+              attempt_states+=("$classification")
+              attempt_codes+=("${code:-}")
+              if [ "$classification" = UP ]; then break; fi
               if [ "$attempt" -eq 1 ]; then sleep 3; fi
             done
             rm -f "$body_file"
-            if [ -n "$best_down" ]; then
-              echo "$best_down"
-            elif [ "$challenge_seen" -eq 1 ] && [ "$classification" != "UP" ]; then
-              echo CHALLENGED
-            elif [ "$classification" = "UNREACHABLE" ]; then
-              echo UNREACHABLE
-            else
-              echo "${code:-000}"
+            result=$(uptime_reduce_attempts "${attempt_states[@]}")
+            if [ "$result" = UP ] || [ "$result" = DOWN ]; then
+              for i in "${!attempt_states[@]}"; do
+                if [ "${attempt_states[$i]}" = "$result" ]; then
+                  echo "${attempt_codes[$i]}"
+                  return 0
+                fi
+              done
             fi
-            return 1
+            echo "$result"
           }
 
           down=()

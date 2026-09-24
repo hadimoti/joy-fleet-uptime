@@ -1,7 +1,7 @@
 # Synthetic uptime monitoring for a small set of public websites.
 #
 # It probes each site from a GitHub-hosted runner every 5 minutes and sends a
-# Telegram message when something is actually wrong.
+# Telegram message for non-green results.
 #
 # The one interesting idea here
 # -----------------------------
@@ -24,11 +24,12 @@
 # ("Just a moment...") while the site is completely healthy for real users --
 # the monitor is simply not allowed to look.
 #
-# Treating that as an outage would page a human every five minutes forever for
-# a non-problem, and the resulting alert fatigue would bury the one real outage
-# that matters. So a challenge is classified as INCONCLUSIVE, never as down,
-# and it never fails the job. To make those hosts genuinely measurable, add a
-# CDN rule that skips bot protection for the monitored paths (/ready, /live).
+# Treating that as DOWN would misreport the host's state. A challenge is
+# classified separately and never counted as UP or DOWN. Both CHALLENGED and
+# ALL_CHALLENGED are successful inconclusive probe outcomes; they emit a GitHub
+# warning and summary entry, without paging. To make those hosts genuinely
+# measurable, add a CDN rule that skips bot protection for the monitored paths
+# (/ready, /live).
 #
 # Why this repository is public
 # -----------------------------
@@ -50,26 +51,48 @@ on:
     # platform load, so treat this as very good monitoring, not a hard SLA.
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      drill:
+        description: Send a labelled Telegram delivery test
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  # If several delayed runs queue up, only the newest matters. Without this a
-  # backlog could fire a burst of duplicate alerts for one incident.
-  group: uptime
-  cancel-in-progress: true
+  # Do not cancel a running probe or its alert. GitHub keeps at most one pending
+  # run in this group, replacing older pending runs if schedule triggers pile up.
+  group: uptime-${{ github.event_name == 'workflow_dispatch' && inputs.drill && 'drill' || 'probe' }}
+  cancel-in-progress: false
 
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Worst path: 12 targets x (2 x 15s curl + one 3s inter-attempt sleep) =
+    # 396s, plus control 10s, alert 20s, and optional drill 20s = 446s (7m26s).
+    # The probe step gets 8m; 18m for the job leaves 10m34s for checkout,
+    # contract checks, step startup, and other runner overhead. The 5m schedule
+    # can overlap in time; non-cancelling concurrency preserves active alerts.
+    timeout-minutes: 18
     steps:
+      - name: Check out workflow files
+        uses: actions/checkout@v4
+        timeout-minutes: 2
+
+      - name: Classification contract
+        shell: bash
+        run: bash tests/uptime-classify.sh
+        timeout-minutes: 2
+
       - name: Probe
         id: probe
         shell: bash
+        timeout-minutes: 8
         run: |
           set -uo pipefail
+          source .github/scripts/uptime-classify.sh
 
           CDN_HOSTS=(
             joyteam.ir
@@ -98,46 +121,23 @@ jobs:
 
           UA='uptime-probe/1.0'
 
-          # Echoes one of:
-          #   <2xx/3xx code>  healthy        (exit 0)
-          #   CHALLENGED      CDN interstitial, inconclusive   (exit 0)
-          #   <code>|000      genuine failure                  (exit 1)
-          #
-          # Two attempts before calling anything down, so a single transient
-          # DNS or TLS blip on a shared runner never wakes anyone up.
+          # Each attempt is UP (2xx/3xx without a challenge marker), CHALLENGED,
+          # DOWN (unmarked 4xx/5xx), or UNREACHABLE (000 or invalid status).
+          # Across at most two attempts, reduce in this order: any UP -> UP;
+          # else any DOWN -> DOWN; else any UNREACHABLE -> UNREACHABLE; else
+          # CHALLENGED. Stop immediately on UP.
           probe() {
-            local url=$1 code
-            for _ in 1 2; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' \
-                       --max-time 15 --connect-timeout 10 \
-                       -A "$UA" "$url" 2>/dev/null)
-              case "$code" in
-                2*|3*)
-                  echo "$code"
-                  return 0
-                  ;;
-                403|503)
-                  # Separate a CDN challenge from a genuine 403/503 by looking
-                  # for the interstitial's own markers in the body.
-                  if curl -s --max-time 15 -A "$UA" "$url" 2>/dev/null \
-                       | head -c 2000 \
-                       | grep -qiE 'just a moment|cf-browser-verification|cf_chl|challenge-platform|__cf_chl|cdn-cgi/challenge'; then
-                    echo "CHALLENGED"
-                    return 0
-                  fi
-                  ;;
-              esac
-              sleep 3
-            done
-            echo "${code:-000}"
-            return 1
+            uptime_probe "$1" "$UA"
           }
 
           down=()
           challenged=()
+          unreachable=()
+          cdn_codes=()
           for h in "${CDN_HOSTS[@]}"; do
-            code=$(probe "https://${h}/") || down+=("${h}(${code})")
-            if [ "$code" = "CHALLENGED" ]; then challenged+=("$h"); fi
+            code=$(probe "https://${h}/") || true
+            uptime_record_cdn_result "$h" "$code" down challenged unreachable
+            cdn_codes+=("$code")
             printf '%-24s %s\n' "$h" "$code"
           done
 
@@ -150,18 +150,8 @@ jobs:
           ready_code=$(probe "$READY_URL") || true
           printf '%-24s %s\n' 'ready' "$ready_code"
 
-          origin_ok=0
-          case "$origin_code" in 2*|3*) origin_ok=1 ;; esac
-          ready_ok=0
-          case "$ready_code" in 2*|3*) ready_ok=1 ;; esac
-
-          n_down=${#down[@]}
           n_chal=${#challenged[@]}
           n_total=${#CDN_HOSTS[@]}
-          # A challenged host is inconclusive: the monitor was denied a look,
-          # which says nothing about whether real users can load the site. Only
-          # hosts that actually answered count toward the verdict.
-          n_answered=$((n_total - n_chal))
 
           if [ "$n_chal" -gt 0 ]; then
             echo ""
@@ -173,22 +163,23 @@ jobs:
             echo ""
           fi
 
-          if [ "$origin_ok" -eq 0 ] && [ "$n_down" -gt 0 ]; then
-            # Origin unreachable AND at least one host genuinely failing is the
-            # only combination that justifies calling this a real outage.
-            verdict="ORIGIN_DOWN"
-          elif [ "$n_down" -gt 0 ] && [ "$n_answered" -gt 0 ] && [ "$n_down" -gt $((n_answered / 2)) ]; then
-            verdict="CDN_EDGE"
-          elif [ "$n_down" -gt 0 ]; then
-            verdict="PARTIAL"
-          elif [ "$origin_ok" -eq 0 ]; then
-            verdict="ORIGIN_ONLY_DOWN"
-          elif [ "$ready_ok" -eq 0 ] && [ "$ready_code" != "CHALLENGED" ]; then
-            verdict="NOT_READY"
-          elif [ "$n_chal" -eq "$n_total" ]; then
-            verdict="ALL_CHALLENGED"
-          else
-            verdict="OK"
+          # Consult an independent control host whenever any target is
+          # transport-ambiguous, then use its response to resolve that evidence.
+          verdict=$(uptime_verdict "$origin_code" "$ready_code" -1 000 "${cdn_codes[@]}")
+          if [ "$verdict" = NEEDS_CONTROL ]; then
+            # Do not use curl -f: any HTTP response (including 403/429) proves
+            # the runner reached the public internet. Only connection failure
+            # or HTTP 000 means PROBE_NETWORK when the verdict depends on it.
+            if control_code=$(curl -s -o /dev/null -w '%{http_code}' \
+                --max-time 10 --connect-timeout 5 \
+                https://api.github.com/ 2>/dev/null); then
+              control_exit=0
+            else
+              control_exit=$?
+            fi
+            control_code=${control_code:-000}
+            printf '%-24s %s\n' 'api.github.com' "$control_code"
+            verdict=$(uptime_verdict "$origin_code" "$ready_code" "$control_exit" "$control_code" "${cdn_codes[@]}")
           fi
 
           {
@@ -197,33 +188,58 @@ jobs:
             echo "origin_code=$origin_code"
             echo "down_list=${down[*]:-none}"
             echo "challenged_list=${challenged[*]:-none}"
+            echo "unreachable_list=${unreachable[*]:-none}"
+            if uptime_should_alert "$verdict"; then
+              echo "alert_required=true"
+            else
+              echo "alert_required=false"
+            fi
           } >> "$GITHUB_OUTPUT"
 
           echo "VERDICT: $verdict"
 
-          # ALL_CHALLENGED is a configuration gap, not an incident. It is
-          # visible in the log without failing the job or waking anyone.
+          if [ "$verdict" = CHALLENGED ] || [ "$verdict" = ALL_CHALLENGED ]; then
+            challenge_targets=("${challenged[@]}")
+            [ "$origin_code" = CHALLENGED ] && challenge_targets+=("$ORIGIN_HOST")
+            [ "$ready_code" = CHALLENGED ] && challenge_targets+=("direct.joyteam.ir/ready")
+            challenge_targets_text=${challenge_targets[*]:-none}
+            echo "::warning::CDN bot challenge; probe is inconclusive and will not page. Challenged hosts: $challenge_targets_text"
+            {
+              echo "### CDN challenge (inconclusive; no Telegram alert)"
+              echo "Challenged hosts: $challenge_targets_text"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Challenges remain a distinct, non-paging outcome. Inconclusive
+          # results without positive health evidence still fail and alert.
           case "$verdict" in
-            OK|ALL_CHALLENGED) exit 0 ;;
+            OK|CHALLENGED|ALL_CHALLENGED) exit 0 ;;
             *) exit 1 ;;
           esac
 
-      - name: Alert
-        if: failure() && steps.probe.outputs.verdict != ''
+      - name: Failure alert
+        # A missing output means the probe crashed before deciding, so retain
+        # the PROBE_CRASH alert fallback. The tested classifier decides known verdicts.
+        if: always() && steps.probe.outputs.alert_required != 'false'
         shell: bash
+        timeout-minutes: 2
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          VERDICT: ${{ steps.probe.outputs.verdict }}
+          VERDICT: ${{ steps.probe.outputs.verdict || 'PROBE_CRASH' }}
           DOWN_LIST: ${{ steps.probe.outputs.down_list }}
+          CHALLENGED_LIST: ${{ steps.probe.outputs.challenged_list }}
+          UNREACHABLE_LIST: ${{ steps.probe.outputs.unreachable_list }}
           READY_CODE: ${{ steps.probe.outputs.ready_code }}
           ORIGIN_CODE: ${{ steps.probe.outputs.origin_code }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -uo pipefail
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
           if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "::warning::Telegram secrets not set; alert not delivered"
-            exit 0
+            echo "::error::Telegram alert failed (required secrets are missing)"
+            exit 1
           fi
 
           case "$VERDICT" in
@@ -237,21 +253,71 @@ jobs:
               headline="Partial outage"
               advice="Some hosts are failing while others serve normally. Check the listed hosts." ;;
             ORIGIN_ONLY_DOWN)
-              headline="Origin host failing (CDN hosts OK)"
-              advice="The direct origin path is down while proxied hosts serve." ;;
+              headline="Origin host failure"
+              advice="The origin host failed the probe. CDN host states are listed separately and do not change this origin result." ;;
             NOT_READY)
               headline="App reports NOT READY"
-              advice="The edge serves but /ready reports a failed dependency. Check the app's upstreams." ;;
+              advice="/ready reports a failed dependency. Check the app and review every listed failing host, including CDN paths." ;;
+            PROBE_INCONCLUSIVE)
+              headline="Probe inconclusive"
+              advice="The probes produced no positive health evidence, or challenges coincided with connection failures. The health check is not green; inspect the probe paths." ;;
             *)
               headline="Probe failed ($VERDICT)"
               advice="See the workflow run." ;;
           esac
 
-          text=$(printf '%s\n\ndown: %s\nready: %s\norigin: %s\n\n%s\n\n%s' \
-            "$headline" "$DOWN_LIST" "$READY_CODE" "$ORIGIN_CODE" "$advice" "$RUN_URL")
+          text=$(printf '%s\n\ndown: %s\nchallenged: %s\nunreachable: %s\nready: %s\norigin: %s\n\n%s\n\n%s' \
+            "$headline" "$DOWN_LIST" "$CHALLENGED_LIST" "$UNREACHABLE_LIST" "$READY_CODE" "$ORIGIN_CODE" "$advice" "$RUN_URL")
 
-          curl -s -o /dev/null --max-time 20 \
+          if status=$(curl -s -o "$response_file" -w '%{http_code}' --max-time 20 \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${text}" \
             --data-urlencode "disable_web_page_preview=true" \
-            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null); then
+            curl_exit=0
+          else
+            curl_exit=$?
+          fi
+          ok=$(jq -r 'if .ok == true then "true" else "false" end' "$response_file" 2>/dev/null || echo false)
+          printf 'Telegram HTTP status: %s; ok: %s\n' "${status:-000}" "$ok"
+          if [ "$curl_exit" -ne 0 ] || [ "${status:-000}" != "200" ] || [ "$ok" != "true" ]; then
+            echo "::error::Telegram alert delivery was not confirmed"
+            exit 1
+          fi
+
+      - name: Telegram delivery drill
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.drill
+        shell: bash
+        timeout-minutes: 2
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "::error::Telegram delivery drill failed (required secrets are missing)"
+            exit 1
+          fi
+
+          timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          text=$(printf '[DRILL] Telegram delivery test\n\nThis is a test message.\nTimestamp: %s\nRun: %s' \
+            "$timestamp" "$RUN_URL")
+          if status=$(curl -s -o "$response_file" -w '%{http_code}' \
+              --max-time 20 --connect-timeout 10 \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${text}" \
+              --data-urlencode "disable_web_page_preview=true" \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" 2>/dev/null); then
+            curl_exit=0
+          else
+            curl_exit=$?
+          fi
+          ok=$(jq -r 'if .ok == true then "true" else "false" end' "$response_file" 2>/dev/null || echo false)
+          printf 'Telegram HTTP status: %s; ok: %s\n' "${status:-000}" "$ok"
+          if [ "$curl_exit" -ne 0 ] || [ "${status:-000}" != "200" ] || [ "$ok" != "true" ]; then
+            echo "::error::Telegram delivery drill was not confirmed"
+            exit 1
+          fi
